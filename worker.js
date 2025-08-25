@@ -79,11 +79,11 @@ function handleOptions() {
 async function initAdmin(env) {
   try {
     const adminKey = `users/${ADMIN_USERNAME}`;
-    const existing = await env.BLOG_KV.get(adminKey);
+    const existing = await env.BLOG_DATA_STORE.get(adminKey);
     if (!existing) {
       // 使用简单哈希
       const passwordHash = simpleSha256(ADMIN_PASSWORD);
-      await env.BLOG_KV.put(adminKey, JSON.stringify({
+      await env.BLOG_DATA_STORE.put(adminKey, JSON.stringify({
         username: ADMIN_USERNAME,
         passwordHash,
         avatar: 'https://api.dicebear.com/7.x/avataaars/svg?seed=admin',
@@ -105,13 +105,13 @@ async function initAdmin(env) {
 async function initDefaultTitles(env) {
   try {
     // 检查头衔是否存在，避免重复创建
-    const founderTitle = await env.BLOG_KV.get('titles/创始人');
-    const adminTitle = await env.BLOG_KV.get('titles/管理员');
-    const memberTitle = await env.BLOG_KV.get('titles/注册会员');
+    const founderTitle = await env.BLOG_DATA_STORE.get('titles/创始人');
+    const adminTitle = await env.BLOG_DATA_STORE.get('titles/管理员');
+    const memberTitle = await env.BLOG_DATA_STORE.get('titles/注册会员');
     
     if (!founderTitle) {
       // 创始人头衔
-      await env.BLOG_KV.put('titles/创始人', JSON.stringify({
+      await env.BLOG_DATA_STORE.put('titles/创始人', JSON.stringify({
         name: '创始人',
         displayName: '创始人',
         color: '#ffd700',
@@ -121,7 +121,7 @@ async function initDefaultTitles(env) {
     
     if (!adminTitle) {
       // 管理员头衔
-      await env.BLOG_KV.put('titles/管理员', JSON.stringify({
+      await env.BLOG_DATA_STORE.put('titles/管理员', JSON.stringify({
         name: '管理员',
         displayName: '管理员',
         color: '#ffd700',
@@ -131,7 +131,7 @@ async function initDefaultTitles(env) {
     
     if (!memberTitle) {
       // 注册会员头衔
-      await env.BLOG_KV.put('titles/注册会员', JSON.stringify({
+      await env.BLOG_DATA_STORE.put('titles/注册会员', JSON.stringify({
         name: '注册会员',
         displayName: '注册会员',
         color: '#ff69b4',
@@ -149,7 +149,7 @@ async function initDefaultTitles(env) {
 async function verifyUser(env, username, password) {
   try {
     const userKey = `users/${username}`;
-    const userData = await env.BLOG_KV.get(userKey);
+    const userData = await env.BLOG_DATA_STORE.get(userKey);
     if (!userData) return null;
     let user;
     try {
@@ -209,13 +209,13 @@ async function checkPermission(env, request) {
   try {
     const token = request.headers.get('Authorization')?.split(' ')[1];
     if (!token) return { valid: false, error: '未提供令牌' };
-    // 检查 SECRET_KEY 是否设置
-    if (!env.SECRET_KEY) {
-      console.error('SECRET_KEY 未设置');
+    // 检查 BLOG_KEY 是否设置
+    if (!env.BLOG_KEY) {
+      console.error('BLOG_KEY 未设置');
       return { valid: false, error: '服务器配置错误' };
     }
     // 验证令牌
-    if (!verifyToken(token, env.SECRET_KEY)) {
+    if (!verifyToken(token, env.BLOG_KEY)) {
       return { valid: false, error: '无效或过期的令牌' };
     }
     // 解码令牌
@@ -225,7 +225,7 @@ async function checkPermission(env, request) {
     }
     // 获取用户信息
     const userKey = `users/${payload.username}`;
-    const userData = await env.BLOG_KV.get(userKey);
+    const userData = await env.BLOG_DATA_STORE.get(userKey);
     if (!userData) {
       return { valid: false, error: '用户不存在' };
     }
@@ -260,12 +260,12 @@ async function checkPermission(env, request) {
 export default {
   async fetch(request, env) {
     try {
-      // 确保 SECRET_KEY 存在
-      if (!env.SECRET_KEY) {
-        console.error('环境变量 SECRET_KEY 未设置');
+      // 确保 BLOG_KEY 存在
+      if (!env.BLOG_KEY) {
+        console.error('环境变量 BLOG_KEY 未设置');
         return safeJsonResponse({ 
           error: '服务器配置错误', 
-          details: 'SECRET_KEY 未设置' 
+          details: 'BLOG_KEY 未设置' 
         }, 500);
       }
       // 初始化管理员
@@ -325,7 +325,7 @@ export default {
             }
             // 检查用户名是否已存在
             try {
-              const existing = await env.BLOG_KV.get(`users/${username}`);
+              const existing = await env.BLOG_DATA_STORE.get(`users/${username}`);
               if (existing) {
                 return safeJsonResponse({ error: '用户名已存在' }, 400);
               }
@@ -336,7 +336,7 @@ export default {
             // 创建新用户
             try {
               const passwordHash = simpleSha256(password);
-              await env.BLOG_KV.put(`users/${username}`, JSON.stringify({
+              await env.BLOG_DATA_STORE.put(`users/${username}`, JSON.stringify({
                 username,
                 passwordHash,
                 avatar: avatar || 'https://api.dicebear.com/7.x/avataaars/svg?seed=default',
@@ -381,7 +381,7 @@ export default {
               };
               const header = btoa(JSON.stringify({ alg: 'HS256' }));
               const payloadStr = btoa(JSON.stringify(payload));
-              const signature = simpleSha256(header + payloadStr + env.SECRET_KEY);
+              const signature = simpleSha256(header + payloadStr + env.BLOG_KEY);
               return safeJsonResponse({
                 token: `${header}.${payloadStr}.${signature}`,
                 username: user.username,
@@ -401,7 +401,7 @@ export default {
           if (pathname.startsWith('/api/users/') && request.method === 'GET') {
             const username = pathname.split('/').pop();
             const userKey = `users/${username}`;
-            const userData = await env.BLOG_KV.get(userKey);
+            const userData = await env.BLOG_DATA_STORE.get(userKey);
             if (!userData) {
               return safeJsonResponse({ error: '用户不存在' }, 404);
             }
@@ -439,7 +439,7 @@ export default {
               return safeJsonResponse({ error: '无效的JSON数据' }, 400);
             }
             const userKey = `users/${username}`;
-            const userData = await env.BLOG_KV.get(userKey);
+            const userData = await env.BLOG_DATA_STORE.get(userKey);
             if (!userData) {
               return safeJsonResponse({ error: '用户不存在' }, 404);
             }
@@ -464,17 +464,17 @@ export default {
               }
               user.passwordHash = simpleSha256(data.newPassword);
             }
-            await env.BLOG_KV.put(userKey, JSON.stringify(user));
+            await env.BLOG_DATA_STORE.put(userKey, JSON.stringify(user));
             return safeJsonResponse({ success: true });
           }
           // 获取所有帖子
           if (pathname === '/api/posts' && request.method === 'GET') {
             try {
-              const list = await env.BLOG_KV.list({ prefix: 'posts/' });
+              const list = await env.BLOG_DATA_STORE.list({ prefix: 'posts/' });
               const posts = [];
               for (const key of list.keys) {
                 try {
-                  const post = await env.BLOG_KV.get(key.name, 'json');
+                  const post = await env.BLOG_DATA_STORE.get(key.name, 'json');
                   if (post) posts.push(post);
                 } catch (e) {
                   console.error('获取帖子时出错:', e, key.name);
@@ -504,7 +504,7 @@ export default {
             }
             try {
               const postId = generateUUID();
-              await env.BLOG_KV.put(`posts/${postId}`, JSON.stringify({
+              await env.BLOG_DATA_STORE.put(`posts/${postId}`, JSON.stringify({
                 id: postId,
                 title,
                 content,
@@ -532,12 +532,12 @@ export default {
             }
             const postId = pathname.split('/').pop();
             try {
-              await env.BLOG_KV.delete(`posts/${postId}`);
+              await env.BLOG_DATA_STORE.delete(`posts/${postId}`);
               // 删除相关评论
-              const commentKeys = await env.BLOG_KV.list({ prefix: `comments/${postId}/` });
+              const commentKeys = await env.BLOG_DATA_STORE.list({ prefix: `comments/${postId}/` });
               if (commentKeys.keys.length > 0) {
                 await Promise.all(commentKeys.keys.map(k => 
-                  env.BLOG_KV.delete(k.name).catch(e => {
+                  env.BLOG_DATA_STORE.delete(k.name).catch(e => {
                     console.error('删除评论时出错:', e, k.name);
                   })
                 ));
@@ -565,7 +565,7 @@ export default {
             const postId = pathname.split('/')[3];
             try {
               const commentId = generateUUID();
-              await env.BLOG_KV.put(`comments/${postId}/${commentId}`, JSON.stringify({
+              await env.BLOG_DATA_STORE.put(`comments/${postId}/${commentId}`, JSON.stringify({
                 id: commentId,
                 content,
                 author: user.username,
@@ -585,11 +585,11 @@ export default {
           if (pathname.startsWith('/api/posts/') && pathname.endsWith('/comments') && request.method === 'GET') {
             const postId = pathname.split('/')[3];
             try {
-              const list = await env.BLOG_KV.list({ prefix: `comments/${postId}/` });
+              const list = await env.BLOG_DATA_STORE.list({ prefix: `comments/${postId}/` });
               const comments = [];
               for (const key of list.keys) {
                 try {
-                  const comment = await env.BLOG_KV.get(key.name, 'json');
+                  const comment = await env.BLOG_DATA_STORE.get(key.name, 'json');
                   if (comment) comments.push(comment);
                 } catch (e) {
                   console.error('获取评论时出错:', e, key.name);
@@ -633,7 +633,7 @@ export default {
             }
             // 获取评论
             try {
-              const comment = await env.BLOG_KV.get(`comments/${postId}/${commentId}`, 'json');
+              const comment = await env.BLOG_DATA_STORE.get(`comments/${postId}/${commentId}`, 'json');
               if (!comment) {
                 return safeJsonResponse({ error: '评论不存在' }, 404);
               }
@@ -642,7 +642,7 @@ export default {
                 return safeJsonResponse({ error: '无权删除此评论' }, 403);
               }
               // 删除评论
-              await env.BLOG_KV.delete(`comments/${postId}/${commentId}`);
+              await env.BLOG_DATA_STORE.delete(`comments/${postId}/${commentId}`);
               return safeJsonResponse({ success: true });
             } catch (e) {
               console.error('删除评论时出错:', e);
@@ -672,7 +672,7 @@ export default {
             }
             try {
               const userKey = `users/${username}`;
-              const userData = await env.BLOG_KV.get(userKey);
+              const userData = await env.BLOG_DATA_STORE.get(userKey);
               if (!userData) {
                 return safeJsonResponse({ error: '用户不存在' }, 404);
               }
@@ -689,7 +689,7 @@ export default {
                 userObj.titles = ['注册会员'];
                 userObj.currentTitle = '注册会员';
               }
-              await env.BLOG_KV.put(userKey, JSON.stringify(userObj));
+              await env.BLOG_DATA_STORE.put(userKey, JSON.stringify(userObj));
               return safeJsonResponse({ 
                 success: true,
                 user: {
@@ -722,7 +722,7 @@ export default {
             }
             try {
               const userKey = `users/${username}`;
-              const userData = await env.BLOG_KV.get(userKey);
+              const userData = await env.BLOG_DATA_STORE.get(userKey);
               if (!userData) {
                 return safeJsonResponse({ error: '用户不存在' }, 404);
               }
@@ -739,7 +739,7 @@ export default {
                 userObj.titles = ['注册会员'];
                 userObj.currentTitle = '注册会员';
               }
-              await env.BLOG_KV.put(userKey, JSON.stringify(userObj));
+              await env.BLOG_DATA_STORE.put(userKey, JSON.stringify(userObj));
               return safeJsonResponse({ 
                 success: true,
                 user: {
@@ -775,7 +775,7 @@ export default {
             }
             try {
               const userKey = `users/${username}`;
-              const userData = await env.BLOG_KV.get(userKey);
+              const userData = await env.BLOG_DATA_STORE.get(userKey);
               if (!userData) {
                 return safeJsonResponse({ error: '用户不存在' }, 404);
               }
@@ -814,7 +814,7 @@ export default {
                 }
               }
               
-              await env.BLOG_KV.put(userKey, JSON.stringify(userObj));
+              await env.BLOG_DATA_STORE.put(userKey, JSON.stringify(userObj));
               return safeJsonResponse({ 
                 success: true,
                 user: {
@@ -849,12 +849,12 @@ export default {
             }
             try {
               // 检查头衔是否已存在
-              const existing = await env.BLOG_KV.get(`titles/${name}`);
+              const existing = await env.BLOG_DATA_STORE.get(`titles/${name}`);
               if (existing) {
                 return safeJsonResponse({ error: '头衔已存在' }, 400);
               }
               // 创建新头衔
-              await env.BLOG_KV.put(`titles/${name}`, JSON.stringify({
+              await env.BLOG_DATA_STORE.put(`titles/${name}`, JSON.stringify({
                 name,
                 displayName,
                 color: color || '#ff0000',
@@ -886,13 +886,13 @@ export default {
             }
             try {
               // 检查头衔是否存在
-              const titleData = await env.BLOG_KV.get(`titles/${titleName}`);
+              const titleData = await env.BLOG_DATA_STORE.get(`titles/${titleName}`);
               if (!titleData) {
                 return safeJsonResponse({ error: '头衔不存在' }, 404);
               }
               // 检查用户是否存在
               const userKey = `users/${username}`;
-              const userData = await env.BLOG_KV.get(userKey);
+              const userData = await env.BLOG_DATA_STORE.get(userKey);
               if (!userData) {
                 return safeJsonResponse({ error: '用户不存在' }, 404);
               }
@@ -918,7 +918,7 @@ export default {
               if (!userObj.currentTitle) {
                 userObj.currentTitle = titleName;
               }
-              await env.BLOG_KV.put(userKey, JSON.stringify(userObj));
+              await env.BLOG_DATA_STORE.put(userKey, JSON.stringify(userObj));
               return safeJsonResponse({ success: true });
             } catch (e) {
               console.error('颁发头衔时出错:', e);
@@ -946,7 +946,7 @@ export default {
             try {
               // 检查用户是否存在
               const userKey = `users/${username}`;
-              const userData = await env.BLOG_KV.get(userKey);
+              const userData = await env.BLOG_DATA_STORE.get(userKey);
               if (!userData) {
                 return safeJsonResponse({ error: '用户不存在' }, 404);
               }
@@ -976,7 +976,7 @@ export default {
                   userObj.currentTitle = null;
                 }
               }
-              await env.BLOG_KV.put(userKey, JSON.stringify(userObj));
+              await env.BLOG_DATA_STORE.put(userKey, JSON.stringify(userObj));
               return safeJsonResponse({ success: true });
             } catch (e) {
               console.error('撤销头衔时出错:', e);
@@ -986,11 +986,11 @@ export default {
           // 获取所有头衔
           if (pathname === '/api/titles' && request.method === 'GET') {
             try {
-              const list = await env.BLOG_KV.list({ prefix: 'titles/' });
+              const list = await env.BLOG_DATA_STORE.list({ prefix: 'titles/' });
               const titles = [];
               for (const key of list.keys) {
                 try {
-                  const title = await env.BLOG_KV.get(key.name, 'json');
+                  const title = await env.BLOG_DATA_STORE.get(key.name, 'json');
                   if (title) titles.push(title);
                 } catch (e) {
                   console.error('获取头衔时出错:', e, key.name);
@@ -1017,7 +1017,7 @@ export default {
               return safeJsonResponse({ error: '接收者和内容是必填项' }, 400);
             }
             // 检查接收者是否存在
-            const toUser = await env.BLOG_KV.get(`users/${to}`);
+            const toUser = await env.BLOG_DATA_STORE.get(`users/${to}`);
             if (!toUser) {
               return safeJsonResponse({ error: '接收者不存在' }, 404);
             }
@@ -1032,10 +1032,10 @@ export default {
               read: false
             };
             // 保存消息
-            await env.BLOG_KV.put(`messages/${messageId}`, JSON.stringify(message));
+            await env.BLOG_DATA_STORE.put(`messages/${messageId}`, JSON.stringify(message));
             // 添加到发送者和接收者的消息列表
-            await env.BLOG_KV.put(`user-messages/${user.username}/${messageId}`, 'sent');
-            await env.BLOG_KV.put(`user-messages/${to}/${messageId}`, 'received');
+            await env.BLOG_DATA_STORE.put(`user-messages/${user.username}/${messageId}`, 'sent');
+            await env.BLOG_DATA_STORE.put(`user-messages/${to}/${messageId}`, 'received');
             return safeJsonResponse({ messageId });
           }
           // 获取消息
@@ -1043,11 +1043,11 @@ export default {
             const { valid, error, user } = await checkPermission(env, request);
             if (!valid) return safeJsonResponse({ error }, 403);
             // 获取所有消息
-            const sentMessages = await env.BLOG_KV.list({ prefix: `user-messages/${user.username}/` });
+            const sentMessages = await env.BLOG_DATA_STORE.list({ prefix: `user-messages/${user.username}/` });
             const messages = [];
             for (const key of sentMessages.keys) {
               const messageId = key.name.split('/').pop();
-              const message = await env.BLOG_KV.get(`messages/${messageId}`, 'json');
+              const message = await env.BLOG_DATA_STORE.get(`messages/${messageId}`, 'json');
               if (message) messages.push(message);
             }
             // 按时间排序
@@ -1060,7 +1060,7 @@ export default {
             if (!valid) return safeJsonResponse({ error }, 403);
             const messageId = pathname.split('/')[3];
             try {
-              const message = await env.BLOG_KV.get(`messages/${messageId}`, 'json');
+              const message = await env.BLOG_DATA_STORE.get(`messages/${messageId}`, 'json');
               if (!message) {
                 return safeJsonResponse({ error: '消息不存在' }, 404);
               }
@@ -1069,7 +1069,7 @@ export default {
                 return safeJsonResponse({ error: '无权操作此消息' }, 403);
               }
               message.read = true;
-              await env.BLOG_KV.put(`messages/${messageId}`, JSON.stringify(message));
+              await env.BLOG_DATA_STORE.put(`messages/${messageId}`, JSON.stringify(message));
               return safeJsonResponse({ success: true });
             } catch (e) {
               console.error('标记消息为已读时出错:', e);
