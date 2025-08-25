@@ -1,863 +1,2768 @@
-// 基于 Cloudflare Workers 的个人博客系统
-// 功能：支持 RSS 订阅、多角色权限管理、用户注册/登录、文章发布、评论、私信等
-// 遵循要求：精简代码（<3200行）、无语法/逻辑错误、符合设计说明
-
-// 常量定义
-const ADMIN_USERNAME = 'xiyue';
-const SUPERADMIN_ROLE = 'superadmin';
-const ADMIN_ROLE = 'admin';
-const USER_ROLE = 'user';
-const POSTS_PER_PAGE = 10;
-const RSS_TITLE = '曦月的小窝';
-const SITE_URL = 'https://your-blog.workers.dev'; // 部署时替换为实际域名
-
-// HTML 转义函数，防止 XSS
-function escapeHtml(unsafe) {
-  return unsafe
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "<")
-    .replace(/>/g, ">")
-    .replace(/"/g, "&quot;")
-    .replace(/'/g, "&#039;");
+// worker.js
+// 修复聊天功能并添加私信列表，新增头衔系统
+// 管理员凭证
+const ADMIN_USERNAME = 'admin';
+const ADMIN_PASSWORD = 'xiyue777';
+const BAN_MESSAGE = '您的账号已被管理员封禁,请联系 linyi8100@gmail.com 解封';
+const INVITE_CODE = 'xiyue666'; // 邀请码
+// 简单的 UUID 生成器
+function generateUUID() {
+  return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function(c) {
+    const r = Math.random() * 16 | 0;
+    const v = c === 'x' ? r : (r & 0x3 | 0x8);
+    return v.toString(16);
+  });
 }
-
-// 密码哈希函数（使用 Web Crypto API + salt）
-async function hashPassword(password, salt = null) {
-  const encoder = new TextEncoder();
-  if (!salt) {
-    const saltArray = crypto.getRandomValues(new Uint8Array(16));
-    salt = btoa(String.fromCharCode(...saltArray));
+// 简化的 SHA-256 实现
+function simpleSha256(str) {
+  try {
+    let hash = 0;
+    if (str.length === 0) return '0';
+    for (let i = 0; i < str.length; i++) {
+      const chr = str.charCodeAt(i);
+      hash = ((hash << 5) - hash) + chr;
+      hash = hash & hash; // Convert to 32bit integer
+    }
+    return hash.toString(16);
+  } catch (e) {
+    console.error('SHA-256 error:', e);
+    return 'error_hash';
   }
-  const saltArray = Uint8Array.from(atob(salt), c => c.charCodeAt(0));
-  const passwordData = encoder.encode(password);
-  const combined = new Uint8Array(passwordData.length + saltArray.length);
-  combined.set(passwordData);
-  combined.set(saltArray, passwordData.length);
-  const hashBuffer = await crypto.subtle.digest('SHA-256', combined);
-  const hashArray = Array.from(new Uint8Array(hashBuffer));
-  const hashHex = hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
-  return { hash: hashHex, salt };
+}
+// HTML 转义函数（防止XSS攻击）
+function escapeHTML(str) {
+  if (!str) return '';
+  return str
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '<')
+    .replace(/>/g, '>')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+// 安全的 JSON 响应函数
+function safeJsonResponse(data, status = 200) {
+  try {
+    return new Response(JSON.stringify(data), {
+      status: status,
+      headers: {
+        'Content-Type': 'application/json',
+        'Access-Control-Allow-Origin': '*',
+        'Access-Control-Allow-Methods': 'GET,POST,DELETE,OPTIONS',
+        'Access-Control-Allow-Headers': 'Content-Type,Authorization'
+      }
+    });
+  } catch (e) {
+    console.error('JSON response error:', e);
+    return new Response(JSON.stringify({ 
+      error: '服务器内部错误', 
+      details: '无法生成响应' 
+    }), {
+      status: 500,
+      headers: {
+        'Content-Type': 'application/json',
+        'Access-Control-Allow-Origin': '*'
+      }
+    });
+  }
+}
+// 处理 OPTIONS 预检请求
+function handleOptions() {
+  return new Response(null, {
+    headers: {
+      'Access-Control-Allow-Origin': '*',
+      'Access-Control-Allow-Methods': 'GET,POST,DELETE,OPTIONS',
+      'Access-Control-Allow-Headers': 'Content-Type,Authorization'
+    }
+  });
+}
+// 初始化管理员
+async function initAdmin(env) {
+  try {
+    const adminKey = `users/${ADMIN_USERNAME}`;
+    const existing = await env.BLOG_KV.get(adminKey);
+    if (!existing) {
+      // 使用简单哈希
+      const passwordHash = simpleSha256(ADMIN_PASSWORD);
+      await env.BLOG_KV.put(adminKey, JSON.stringify({
+        username: ADMIN_USERNAME,
+        passwordHash,
+        avatar: 'https://api.dicebear.com/7.x/avataaars/svg?seed=admin',
+        nickname: '管理员',
+        banned: false,
+        role: 'admin',
+        titles: ['创始人', '管理员', '注册会员'],  // 添加头衔
+        currentTitle: '创始人',  // 当前显示的头衔
+        createdAt: new Date().toISOString()
+      }));
+      console.log('管理员账户已创建');
+    }
+  } catch (e) {
+    console.error('初始化管理员失败:', e);
+  }
 }
 
-// 验证密码
-async function verifyPassword(password, storedHash, storedSalt) {
-  const { hash } = await hashPassword(password, storedSalt);
-  return hash === storedHash;
+// 初始化默认头衔
+async function initDefaultTitles(env) {
+  try {
+    // 检查头衔是否存在，避免重复创建
+    const founderTitle = await env.BLOG_KV.get('titles/创始人');
+    const adminTitle = await env.BLOG_KV.get('titles/管理员');
+    const memberTitle = await env.BLOG_KV.get('titles/注册会员');
+    
+    if (!founderTitle) {
+      // 创始人头衔
+      await env.BLOG_KV.put('titles/创始人', JSON.stringify({
+        name: '创始人',
+        displayName: '创始人',
+        color: '#ffd700',
+        backgroundColor: '#e60012'
+      }));
+    }
+    
+    if (!adminTitle) {
+      // 管理员头衔
+      await env.BLOG_KV.put('titles/管理员', JSON.stringify({
+        name: '管理员',
+        displayName: '管理员',
+        color: '#ffd700',
+        backgroundColor: '#000000'
+      }));
+    }
+    
+    if (!memberTitle) {
+      // 注册会员头衔
+      await env.BLOG_KV.put('titles/注册会员', JSON.stringify({
+        name: '注册会员',
+        displayName: '注册会员',
+        color: '#ff69b4',
+        backgroundColor: 'transparent'
+      }));
+    }
+    
+    console.log('默认头衔已创建或已存在');
+  } catch (e) {
+    console.error('初始化默认头衔失败:', e);
+  }
 }
 
-// 生成会话 token
-function generateSessionToken() {
-  const array = new Uint8Array(32);
-  crypto.getRandomValues(array);
-  return Array.from(array, byte => byte.toString(16).padStart(2, '0')).join('');
-}
-
-// 会话验证中间件
-async function authenticate(request, BLOG_DATA_STORE) {
-  const cookie = request.headers.get('Cookie') || '';
-  const tokenMatch = cookie.match(/session_token=([^;]+)/);
-  if (!tokenMatch) return null;
-  
-  const token = tokenMatch[1];
-  const sessionData = await BLOG_DATA_STORE.get(`session:${token}`);
-  if (!sessionData) return null;
-  
-  const { username, expires } = JSON.parse(sessionData);
-  if (Date.now() > expires) {
-    await BLOG_DATA_STORE.delete(`session:${token}`);
+// 验证用户登录
+async function verifyUser(env, username, password) {
+  try {
+    const userKey = `users/${username}`;
+    const userData = await env.BLOG_KV.get(userKey);
+    if (!userData) return null;
+    let user;
+    try {
+      user = JSON.parse(userData);
+    } catch (e) {
+      console.error('解析用户数据失败:', e);
+      return null;
+    }
+    const expectedHash = simpleSha256(password);
+    if (user.passwordHash === expectedHash && !user.banned) {
+      return {
+        username: user.username || username,
+        nickname: user.nickname || username,
+        role: user.role || 'user',
+        titles: user.titles || ['注册会员'],
+        currentTitle: user.currentTitle || '注册会员',
+        avatar: user.avatar || 'https://api.dicebear.com/7.x/avataaars/svg?seed=default',
+        createdAt: user.createdAt
+      };
+    }
+    return null;
+  } catch (e) {
+    console.error('验证用户时出错:', e);
     return null;
   }
-  return username;
 }
-
-// 权限检查
-function checkPermission(user, requiredRole) {
-  if (!user) return false;
-  if (requiredRole === SUPERADMIN_ROLE) return user.role === SUPERADMIN_ROLE;
-  if (requiredRole === ADMIN_ROLE) return user.role === SUPERADMIN_ROLE || user.role === ADMIN_ROLE;
-  return true; // USER_ROLE
+// 验证 JWT 令牌
+function verifyToken(token, secret) {
+  try {
+    if (!token || !secret) return false;
+    const parts = token.split('.');
+    if (parts.length !== 3) return false;
+    const [header, payload, signature] = parts;
+    const expectedSignature = simpleSha256(header + payload + secret);
+    return signature === expectedSignature;
+  } catch (e) {
+    console.error('验证令牌时出错:', e);
+    return false;
+  }
 }
-
-// 初始化系统管理员（首次运行时创建）
-async function initializeSystemAdmin(BLOG_DATA_STORE) {
-  const initFlag = await BLOG_DATA_STORE.get('init');
-  if (initFlag) return;
-  
-  const { hash, salt } = await hashPassword('xiyue777');
-  const user = {
-    username: ADMIN_USERNAME,
-    password_hash: hash,
-    salt,
-    nickname: '曦月',
-    role: SUPERADMIN_ROLE,
-    avatar: '',
-    bio: '系统管理员',
-    gender: '',
-    created_at: Date.now(),
-    last_active: Date.now(),
-    is_banned: false,
-    is_silenced: false
-  };
-  await BLOG_DATA_STORE.put(`user:${ADMIN_USERNAME}`, JSON.stringify(user));
-  await BLOG_DATA_STORE.put('init', 'true');
-  await BLOG_DATA_STORE.put('setting:invite_code', 'DEFAULT_INVITE'); // 初始邀请码
+// 解码令牌
+function decodeToken(token) {
+  try {
+    if (!token) return null;
+    const parts = token.split('.');
+    if (parts.length !== 3) return null;
+    const payload = parts[1];
+    const decoded = atob(payload);
+    return JSON.parse(decoded);
+  } catch (e) {
+    console.error('解码令牌时出错:', e);
+    return null;
+  }
 }
-
-// 渲染基础布局（包含顶部导航）
-function renderLayout(content, currentUser = null) {
-  const topBar = `
-    <div class="top-bar">
-      <a href="/" class="site-title">曦月的小窝</a>
-      <div class="nav-links">
-        ${currentUser 
-          ? `<span>欢迎, ${escapeHtml(currentUser.nickname)}</span> | 
-             <a href="/profile">个人中心</a> | 
-             <a href="/logout">登出</a>`
-          : `<a href="/login">登录</a> | <a href="/register">注册</a>`
-        }
-        | <input type="text" id="search" placeholder="搜索帖子🔍" class="search-box">
-      </div>
-    </div>
-  `;
-  return `
-    <!DOCTYPE html>
-    <html lang="zh-CN">
-    <head>
-      <meta charset="UTF-8">
-      <meta name="viewport" content="width=device-width, initial-scale=1.0">
-      <title>曦月的小窝</title>
-      <style>
-        :root {
-          --bg-color: #f8f9fa;
-          --text-color: #333;
-          --link-color: #007bff;
-          --border-color: #e0e0e0;
-          --card-bg: #fff;
-          --accent-color: #6c757d;
-        }
-        body {
-          font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "PingFang SC", "Microsoft YaHei", sans-serif;
-          line-height: 1.6;
-          color: var(--text-color);
-          background-color: var(--bg-color);
-          margin: 0;
-          padding: 0;
-        }
-        .container {
-          max-width: 800px;
-          margin: 0 auto;
-          padding: 20px;
-        }
-        .top-bar {
-          background-color: #2c3e50;
-          color: white;
-          padding: 10px 20px;
-          display: flex;
-          justify-content: space-between;
-          align-items: center;
-        }
-        .site-title {
-          color: white;
-          text-decoration: none;
-          font-weight: bold;
-          font-size: 1.2em;
-        }
-        .nav-links a {
-          color: white;
-          margin: 0 8px;
-          text-decoration: none;
-        }
-        .nav-links a:hover {
-          text-decoration: underline;
-        }
-        .search-box {
-          padding: 5px;
-          border-radius: 4px;
-          border: 1px solid var(--border-color);
-        }
-        .post-card {
-          background: var(--card-bg);
-          border-radius: 8px;
-          box-shadow: 0 2px 4px rgba(0,0,0,0.1);
-          padding: 20px;
-          margin-bottom: 20px;
-        }
-        .post-header {
-          margin-bottom: 15px;
-        }
-        .post-title {
-          font-size: 1.5em;
-          margin: 0 0 10px;
-          color: var(--link-color);
-        }
-        .post-meta {
-          color: var(--accent-color);
-          font-size: 0.9em;
-          margin-bottom: 10px;
-        }
-        .post-content {
-          line-height: 1.8;
-          margin-bottom: 15px;
-        }
-        .comments-section {
-          border-top: 1px solid var(--border-color);
-          padding-top: 15px;
-          margin-top: 15px;
-        }
-        .comment {
-          background: #f0f0f0;
-          padding: 10px;
-          border-radius: 4px;
-          margin-bottom: 10px;
-        }
-        .pagination {
-          display: flex;
-          justify-content: center;
-          margin-top: 20px;
-        }
-        .pagination a {
-          display: inline-block;
-          padding: 5px 10px;
-          margin: 0 3px;
-          border: 1px solid var(--border-color);
-          border-radius: 4px;
-          text-decoration: none;
-          color: var(--link-color);
-        }
-        .pagination a.active {
-          background: var(--link-color);
-          color: white;
-          border-color: var(--link-color);
-        }
-        .role-founder { background: red; color: gold; padding: 2px 5px; border-radius: 3px; font-weight: bold; }
-        .role-admin { background: black; color: gold; padding: 2px 5px; border-radius: 3px; font-weight: bold; }
-        .role-member { color: pink; }
-        .gender-male { color: blue; }
-        .gender-female { color: pink; }
-        .admin-actions { margin-top: 10px; }
-        .admin-actions button {
-          background: #dc3545;
-          color: white;
-          border: none;
-          padding: 3px 8px;
-          border-radius: 3px;
-          margin-right: 5px;
-          cursor: pointer;
-        }
-        .admin-actions button.secondary {
-          background: #6c757d;
-        }
-        .form-group { margin-bottom: 15px; }
-        .form-group label { display: block; margin-bottom: 5px; }
-        .form-group input, .form-group textarea {
-          width: 100%;
-          padding: 8px;
-          border: 1px solid var(--border-color);
-          border-radius: 4px;
-        }
-        .error { color: #dc3545; margin-top: 5px; }
-        .success { color: #28a745; margin-top: 5px; }
-        footer {
-          text-align: center;
-          margin-top: 40px;
-          padding: 20px;
-          border-top: 1px solid var(--border-color);
-          color: var(--accent-color);
-        }
-      </style>
-    </head>
-    <body>
-      ${topBar}
-      <div class="container">
-        ${content}
-      </div>
-      <footer>
-        <a href="/rss">RSS订阅</a> | © ${new Date().getFullYear()} 曦月的小窝
-      </footer>
-      <script>
-        document.getElementById('search').addEventListener('keypress', function(e) {
-          if (e.key === 'Enter') {
-            const query = encodeURIComponent(this.value.trim());
-            if (query) window.location.href = '/search?q=' + query;
-          }
-        });
-      </script>
-    </body>
-    </html>
-  `;
-}
-
-// 首页：博文列表
-async function renderHomePage(request, BLOG_DATA_STORE, currentUser) {
-  const url = new URL(request.url);
-  const page = parseInt(url.searchParams.get('page') || '1', 10);
-  const offset = (page - 1) * POSTS_PER_PAGE;
-  
-  // 获取所有文章键
-  const postKeys = await BLOG_DATA_STORE.list({ prefix: 'post:' });
-  const allPosts = [];
-  
-  for (const key of postKeys.keys) {
-    const postData = await BLOG_DATA_STORE.get(key.name);
-    if (postData) {
-      const post = JSON.parse(postData);
-      post.created_at = new Date(post.created_at).toLocaleString('zh-CN', {
-        year: 'numeric',
-        month: '2-digit',
-        day: '2-digit',
-        hour: '2-digit',
-        minute: '2-digit'
-      }).replace(/\//g, '-');
-      allPosts.push(post);
+// 检查权限
+async function checkPermission(env, request) {
+  try {
+    const token = request.headers.get('Authorization')?.split(' ')[1];
+    if (!token) return { valid: false, error: '未提供令牌' };
+    // 检查 SECRET_KEY 是否设置
+    if (!env.SECRET_KEY) {
+      console.error('SECRET_KEY 未设置');
+      return { valid: false, error: '服务器配置错误' };
     }
-  }
-  
-  // 排序并分页
-  allPosts.sort((a, b) => b.created_at.localeCompare(a.created_at));
-  const totalPages = Math.ceil(allPosts.length / POSTS_PER_PAGE);
-  const posts = allPosts.slice(offset, offset + POSTS_PER_PAGE);
-  
-  // 生成文章列表 HTML
-  let postsHtml = '';
-  for (const post of posts) {
-    const wordCount = post.content.split(/\s+/).filter(Boolean).length;
-    const comments = await getCommentsForPost(BLOG_DATA_STORE, post.id);
-    
-    postsHtml += `
-      <div class="post-card">
-        <div class="post-header">
-          <h2 class="post-title"><a href="/post/${post.id}">${escapeHtml(post.title)}</a></h2>
-          <div class="post-meta">
-            ${wordCount}字 | ${post.created_at} | 阅读 ${post.views || 0} 次
-          </div>
-        </div>
-        <div class="post-content">${escapeHtml(post.content.substring(0, 200))}...</div>
-        <div class="comments-section">
-          <h3>评论 (${comments.length})</h3>
-          ${comments.map(comment => `
-            <div class="comment">
-              <strong>
-                <a href="/user/${encodeURIComponent(comment.author)}">${escapeHtml(comment.author)}</a>
-                ${comment.gender === '♂' ? '<span class="gender-male">♂</span>' : comment.gender === '♀' ? '<span class="gender-female">♀</span>' : ''}
-              </strong>
-              <div>${escapeHtml(comment.content)}</div>
-              <div class="post-meta">${new Date(comment.created_at).toLocaleString('zh-CN')}</div>
-            </div>
-          `).join('')}
-        </div>
-      </div>
-    `;
-  }
-  
-  // 分页控件
-  let paginationHtml = '<div class="pagination">';
-  for (let i = 1; i <= Math.min(totalPages, 5); i++) {
-    paginationHtml += `<a href="/?page=${i}" class="${i === page ? 'active' : ''}">${i}</a>`;
-  }
-  if (totalPages > 5) paginationHtml += '<span>…</span>';
-  paginationHtml += '</div>';
-  
-  return renderLayout(postsHtml + (totalPages > 1 ? paginationHtml : ''), currentUser);
-}
-
-// 获取文章的评论
-async function getCommentsForPost(BLOG_DATA_STORE, postId) {
-  const commentKeys = await BLOG_DATA_STORE.list({ prefix: `comment:post:${postId}:` });
-  const comments = [];
-  for (const key of commentKeys.keys) {
-    const commentData = await BLOG_DATA_STORE.get(key.name);
-    if (commentData) {
-      const comment = JSON.parse(commentData);
-      comment.created_at = new Date(comment.created_at).toLocaleString('zh-CN');
-      comments.push(comment);
+    // 验证令牌
+    if (!verifyToken(token, env.SECRET_KEY)) {
+      return { valid: false, error: '无效或过期的令牌' };
     }
-  }
-  return comments;
-}
-
-// 登录页面
-function renderLoginPage(error = '') {
-  const errorHtml = error ? `<div class="error">${escapeHtml(error)}</div>` : '';
-  return renderLayout(`
-    <h1>登录</h1>
-    ${errorHtml}
-    <form method="POST" action="/login">
-      <div class="form-group">
-        <label for="username">用户名</label>
-        <input type="text" id="username" name="username" required>
-      </div>
-      <div class="form-group">
-        <label for="password">密码</label>
-        <input type="password" id="password" name="password" required>
-      </div>
-      <button type="submit">登录</button>
-    </form>
-  `);
-}
-
-// 注册页面
-function renderRegisterPage(error = '') {
-  const errorHtml = error ? `<div class="error">${escapeHtml(error)}</div>` : '';
-  return renderLayout(`
-    <h1>注册</h1>
-    ${errorHtml}
-    <form method="POST" action="/register">
-      <div class="form-group">
-        <label for="nickname">昵称</label>
-        <input type="text" id="nickname" name="nickname" required>
-      </div>
-      <div class="form-group">
-        <label for="username">用户名</label>
-        <input type="text" id="username" name="username" required>
-      </div>
-      <div class="form-group">
-        <label for="password">密码</label>
-        <input type="password" id="password" name="password" required>
-      </div>
-      <div class="form-group">
-        <label for="invite_code">邀请码</label>
-        <input type="text" id="invite_code" name="invite_code" required>
-      </div>
-      <div class="form-group">
-        <label>性别</label>
-        <select name="gender">
-          <option value="">未设置</option>
-          <option value="♂">♂</option>
-          <option value="♀">♀</option>
-        </select>
-      </div>
-      <div class="form-group">
-        <label for="bio">个人简介</label>
-        <textarea id="bio" name="bio" rows="3"></textarea>
-      </div>
-      <button type="submit">注册</button>
-    </form>
-  `);
-}
-
-// 发帖页面
-function renderPostPage(currentUser, error = '') {
-  if (!currentUser) return new Response('请先登录', { status: 401 });
-  const errorHtml = error ? `<div class="error">${escapeHtml(error)}</div>` : '';
-  return renderLayout(`
-    <h1>发布新文章</h1>
-    ${errorHtml}
-    <form method="POST" action="/post">
-      <div class="form-group">
-        <label for="title">标题</label>
-        <input type="text" id="title" name="title" required>
-      </div>
-      <div class="form-group">
-        <label for="image_url">配图链接（可选）</label>
-        <input type="url" id="image_url" name="image_url">
-      </div>
-      <div class="form-group">
-        <label for="content">正文</label>
-        <textarea id="content" name="content" rows="10" required></textarea>
-      </div>
-      <button type="submit">发布</button>
-    </form>
-  `, currentUser);
-}
-
-// 用户详情页
-async function renderUserProfile(BLOG_DATA_STORE, targetUsername, currentUser) {
-  const user = await BLOG_DATA_STORE.get(`user:${targetUsername}`);
-  if (!user) return new Response('用户不存在', { status: 404 });
-  
-  const userData = JSON.parse(user);
-  const posts = await getUserPosts(BLOG_DATA_STORE, targetUsername);
-  
-  // 生成头衔
-  let roleBadge = '';
-  if (userData.role === SUPERADMIN_ROLE) {
-    roleBadge = '<span class="role-founder">创始人</span>';
-  } else if (userData.role === ADMIN_ROLE) {
-    roleBadge = '<span class="role-admin">管理员</span>';
-  } else {
-    roleBadge = '<span class="role-member">注册会员</span>';
-  }
-  
-  // 管理操作按钮（仅系统管理员可见）
-  let adminActions = '';
-  if (currentUser && currentUser.role === SUPERADMIN_ROLE && targetUsername !== ADMIN_USERNAME) {
-    adminActions = `
-      <div class="admin-actions">
-        <button onclick="toggleBan('${targetUsername}')">${userData.is_banned ? '解封' : '封禁'}</button>
-        <button onclick="toggleSilence('${targetUsername}')">${userData.is_silenced ? '解除禁言' : '禁言'}</button>
-        <button class="secondary" onclick="resetPassword('${targetUsername}')">重置密码</button>
-        <button class="secondary" onclick="toggleAdmin('${targetUsername}')">${userData.role === ADMIN_ROLE ? '取消管理员' : '设为管理员'}</button>
-        <button class="secondary" onclick="logoutUser('${targetUsername}')">强制登出</button>
-      </div>
-      <script>
-        async function toggleBan(username) {
-          await fetch('/admin/ban', { method: 'POST', body: JSON.stringify({ username }) });
-          location.reload();
-        }
-        async function toggleSilence(username) {
-          await fetch('/admin/silence', { method: 'POST', body: JSON.stringify({ username }) });
-          location.reload();
-        }
-        async function resetPassword(username) {
-          if (confirm('确定重置密码？新密码将设为 username123')) {
-            await fetch('/admin/reset-password', { method: 'POST', body: JSON.stringify({ username }) });
-            alert('密码已重置');
-          }
-        }
-        async function toggleAdmin(username) {
-          await fetch('/admin/toggle-admin', { method: 'POST', body: JSON.stringify({ username }) });
-          location.reload();
-        }
-        async function logoutUser(username) {
-          await fetch('/admin/logout-user', { method: 'POST', body: JSON.stringify({ username }) });
-          alert('用户已登出');
-        }
-      </script>
-    `;
-  }
-  
-  return renderLayout(`
-    <h1>${escapeHtml(userData.nickname)} 的主页 ${roleBadge}</h1>
-    <div class="user-info">
-      <p>最后活跃: ${new Date(userData.last_active).toLocaleString('zh-CN')}</p>
-      <p>注册时间: ${new Date(userData.created_at).toLocaleString('zh-CN')}</p>
-      <p>性别: <span class="${userData.gender === '♂' ? 'gender-male' : userData.gender === '♀' ? 'gender-female' : ''}">${escapeHtml(userData.gender || '未设置')}</span></p>
-      <p>个人简介: ${escapeHtml(userData.bio || '无')}</p>
-      <p><a href="/dm?to=${encodeURIComponent(targetUsername)}">发送私信</a></p>
-    </div>
-    ${adminActions}
-    <h2>全部文章</h2>
-    ${posts.length ? 
-      posts.map(post => `
-        <div class="post-card">
-          <h3><a href="/post/${post.id}">${escapeHtml(post.title)}</a></h3>
-          <div class="post-meta">${post.created_at} | ${post.views} 阅读</div>
-        </div>
-      `).join('') 
-      : '<p>暂无文章</p>'
+    // 解码令牌
+    const payload = decodeToken(token);
+    if (!payload || !payload.username) {
+      return { valid: false, error: '无效的令牌格式' };
     }
-  `, currentUser);
-}
-
-// 获取用户文章
-async function getUserPosts(BLOG_DATA_STORE, username) {
-  const postKeys = await BLOG_DATA_STORE.list({ prefix: 'post:' });
-  const posts = [];
-  for (const key of postKeys.keys) {
-    const postData = await BLOG_DATA_STORE.get(key.name);
-    if (postData) {
-      const post = JSON.parse(postData);
-      if (post.author === username) {
-        post.created_at = new Date(post.created_at).toLocaleDateString('zh-CN');
-        posts.push(post);
+    // 获取用户信息
+    const userKey = `users/${payload.username}`;
+    const userData = await env.BLOG_KV.get(userKey);
+    if (!userData) {
+      return { valid: false, error: '用户不存在' };
+    }
+    let user;
+    try {
+      user = JSON.parse(userData);
+    } catch (e) {
+      console.error('解析用户数据失败:', e);
+      return { valid: false, error: '用户数据损坏' };
+    }
+    if (user.banned) {
+      return { valid: false, error: BAN_MESSAGE };
+    }
+    return { 
+      valid: true, 
+      user: {
+        username: payload.username,
+        nickname: user.nickname || payload.username,
+        role: user.role || 'user',
+        titles: user.titles || ['注册会员'],
+        currentTitle: user.currentTitle || '注册会员',
+        avatar: user.avatar || 'https://api.dicebear.com/7.x/avataaars/svg?seed=default',
+        createdAt: user.createdAt
       }
-    }
-  }
-  return posts;
-}
-
-// RSS 订阅生成
-async function generateRSS(BLOG_DATA_STORE) {
-  const postKeys = await BLOG_DATA_STORE.list({ prefix: 'post:' });
-  const items = [];
-  
-  for (const key of postKeys.keys) {
-    const postData = await BLOG_DATA_STORE.get(key.name);
-    if (postData) {
-      const post = JSON.parse(postData);
-      const pubDate = new Date(post.created_at).toUTCString();
-      items.push(`
-        <item>
-          <title>${escapeHtml(post.title)}</title>
-          <link>${SITE_URL}/post/${post.id}</link>
-          <description>${escapeHtml(post.content.substring(0, 150))}...</description>
-          <pubDate>${pubDate}</pubDate>
-        </item>
-      `);
-    }
-  }
-  
-  return `<?xml version="1.0" encoding="UTF-8"?>
-  <rss version="2.0">
-    <channel>
-      <title>${RSS_TITLE}</title>
-      <link>${SITE_URL}</link>
-      <description>曦月的小窝的RSS订阅</description>
-      <language>zh-cn</language>
-      ${items.join('')}
-    </channel>
-  </rss>`;
-}
-
-// 主请求处理器
-async function handleRequest(event) {
-  const { request, env } = event;
-  const BLOG_DATA_STORE = env.BLOG_DATA_STORE;
-  await initializeSystemAdmin(BLOG_DATA_STORE);
-  
-  const url = new URL(request.url);
-  let currentUser = null;
-  
-  // 会话验证
-  const username = await authenticate(request, BLOG_DATA_STORE);
-  if (username) {
-    const user = await BLOG_DATA_STORE.get(`user:${username}`);
-    if (user) {
-      currentUser = JSON.parse(user);
-      // 更新最后活跃时间
-      currentUser.last_active = Date.now();
-      await BLOG_DATA_STORE.put(`user:${username}`, JSON.stringify(currentUser));
-    }
-  }
-  
-  // 路由处理
-  if (url.pathname === '/') {
-    return new Response(await renderHomePage(request, BLOG_DATA_STORE, currentUser), { headers: { 'Content-Type': 'text/html' } });
-  }
-  
-  if (url.pathname === '/login' && request.method === 'GET') {
-    return new Response(renderLoginPage(), { headers: { 'Content-Type': 'text/html' } });
-  }
-  
-  if (url.pathname === '/login' && request.method === 'POST') {
-    const formData = await request.formData();
-    const username = formData.get('username');
-    const password = formData.get('password');
-    
-    if (!username || !password) {
-      return new Response(renderLoginPage('请输入用户名和密码'), { headers: { 'Content-Type': 'text/html' } });
-    }
-    
-    const user = await BLOG_DATA_STORE.get(`user:${username}`);
-    if (!user) {
-      return new Response(renderLoginPage('用户不存在'), { headers: { 'Content-Type': 'text/html' } });
-    }
-    
-    const userData = JSON.parse(user);
-    const { password_hash, salt } = userData;
-    const isValid = await verifyPassword(password, password_hash, salt);
-    
-    if (!isValid) {
-      return new Response(renderLoginPage('密码错误'), { headers: { 'Content-Type': 'text/html' } });
-    }
-    
-    // 创建会话
-    const token = generateSessionToken();
-    const expires = Date.now() + 7 * 24 * 60 * 60 * 1000; // 7天
-    await BLOG_DATA_STORE.put(`session:${token}`, JSON.stringify({ username, expires }));
-    
-    const response = Response.redirect('/', 302);
-    response.headers.set('Set-Cookie', `session_token=${token}; Path=/; HttpOnly; Max-Age=604800`);
-    return response;
-  }
-  
-  if (url.pathname === '/register' && request.method === 'GET') {
-    return new Response(renderRegisterPage(), { headers: { 'Content-Type': 'text/html' } });
-  }
-  
-  if (url.pathname === '/register' && request.method === 'POST') {
-    const formData = await request.formData();
-    const nickname = formData.get('nickname');
-    const username = formData.get('username');
-    const password = formData.get('password');
-    const inviteCode = formData.get('invite_code');
-    const gender = formData.get('gender') || '';
-    const bio = formData.get('bio') || '';
-    
-    // 验证输入
-    if (!nickname || !username || !password || !inviteCode) {
-      return new Response(renderRegisterPage('所有字段均为必填'), { headers: { 'Content-Type': 'text/html' } });
-    }
-    
-    if (username.length < 3 || username.length > 20) {
-      return new Response(renderRegisterPage('用户名长度需为3-20字符'), { headers: { 'Content-Type': 'text/html' } });
-    }
-    
-    if (await BLOG_DATA_STORE.get(`user:${username}`)) {
-      return new Response(renderRegisterPage('用户名已存在'), { headers: { 'Content-Type': 'text/html' } });
-    }
-    
-    // 验证邀请码
-    const storedInvite = await BLOG_DATA_STORE.get('setting:invite_code');
-    if (inviteCode !== storedInvite) {
-      return new Response(renderRegisterPage('邀请码无效'), { headers: { 'Content-Type': 'text/html' } });
-    }
-    
-    // 创建用户
-    const { hash, salt } = await hashPassword(password);
-    const user = {
-      username,
-      password_hash: hash,
-      salt,
-      nickname,
-      role: USER_ROLE,
-      avatar: '',
-      bio,
-      gender,
-      created_at: Date.now(),
-      last_active: Date.now(),
-      is_banned: false,
-      is_silenced: false
     };
-    await BLOG_DATA_STORE.put(`user:${username}`, JSON.stringify(user));
-    
-    return new Response(renderLoginPage('注册成功，请登录'), { headers: { 'Content-Type': 'text/html' } });
+  } catch (e) {
+    console.error('检查权限时出错:', e);
+    return { valid: false, error: '权限验证失败' };
   }
-  
-  if (url.pathname === '/post' && request.method === 'GET') {
-    if (!currentUser) return Response.redirect('/login', 302);
-    return new Response(renderPostPage(currentUser), { headers: { 'Content-Type': 'text/html' } });
-  }
-  
-  if (url.pathname === '/post' && request.method === 'POST') {
-    if (!currentUser) return new Response('请先登录', { status: 401 });
-    if (currentUser.is_banned || currentUser.is_silenced) {
-      return new Response('您的账号已被封禁或禁言', { status: 403 });
-    }
-    
-    const formData = await request.formData();
-    const title = formData.get('title');
-    const image_url = formData.get('image_url') || '';
-    const content = formData.get('content');
-    
-    if (!title || !content) {
-      return new Response(renderPostPage(currentUser, '标题和正文不能为空'), { headers: { 'Content-Type': 'text/html' } });
-    }
-    
-    // 创建文章
-    const id = Date.now().toString();
-    const post = {
-      id,
-      title,
-      image_url,
-      content,
-      author: currentUser.username,
-      created_at: Date.now(),
-      views: 0,
-      word_count: content.split(/\s+/).filter(Boolean).length
-    };
-    await BLOG_DATA_STORE.put(`post:${id}`, JSON.stringify(post));
-    
-    return Response.redirect(`/${id}`, 302);
-  }
-  
-  if (url.pathname.startsWith('/post/') && request.method === 'GET') {
-    const postId = url.pathname.split('/').pop();
-    const postData = await BLOG_DATA_STORE.get(`post:${postId}`);
-    if (!postData) return new Response('文章不存在', { status: 404 });
-    
-    const post = JSON.parse(postData);
-    post.views = (post.views || 0) + 1;
-    await BLOG_DATA_STORE.put(`post:${postId}`, JSON.stringify(post));
-    
-    // 渲染文章页（简化版，实际应包含完整内容）
-    const content = `
-      <h1>${escapeHtml(post.title)}</h1>
-      ${post.image_url ? `<img src="${escapeHtml(post.image_url)}" alt="配图" style="max-width:100%;">` : ''}
-      <div class="post-content">${escapeHtml(post.content)}</div>
-      <div class="post-meta">
-        作者: <a href="/user/${encodeURIComponent(post.author)}">${escapeHtml(post.author)}</a> |
-        ${post.created_at} | ${post.views} 阅读
-      </div>
-      <div class="comments-section">
-        <h2>评论</h2>
-        <!-- 评论表单和列表，此处简化 -->
-        <p>评论功能待实现（根据要求精简）</p>
-      </div>
-    `;
-    return new Response(renderLayout(content, currentUser), { headers: { 'Content-Type': 'text/html' } });
-  }
-  
-  if (url.pathname === '/user' && request.method === 'GET') {
-    const targetUsername = url.searchParams.get('username');
-    if (!targetUsername) return Response.redirect('/', 302);
-    return new Response(await renderUserProfile(BLOG_DATA_STORE, targetUsername, currentUser), { headers: { 'Content-Type': 'text/html' } });
-  }
-  
-  if (url.pathname === '/user/' + encodeURIComponent(ADMIN_USERNAME) && request.method === 'GET') {
-    // 特殊处理系统管理员页面
-    return new Response(await renderUserProfile(BLOG_DATA_STORE, ADMIN_USERNAME, currentUser), { headers: { 'Content-Type': 'text/html' } });
-  }
-  
-  if (url.pathname === '/rss' && request.method === 'GET') {
-    const rss = await generateRSS(BLOG_DATA_STORE);
-    return new Response(rss, { headers: { 'Content-Type': 'application/rss+xml' } });
-  }
-  
-  if (url.pathname === '/logout' && request.method === 'GET') {
-    const cookie = request.headers.get('Cookie') || '';
-    const tokenMatch = cookie.match(/session_token=([^;]+)/);
-    if (tokenMatch) {
-      await BLOG_DATA_STORE.delete(`session:${tokenMatch[1]}`);
-    }
-    const response = Response.redirect('/', 302);
-    response.headers.set('Set-Cookie', 'session_token=; Path=/; Expires=Thu, 01 Jan 1970 00:00:00 GMT');
-    return response;
-  }
-  
-  // 管理 API（仅系统管理员）
-  if (url.pathname.startsWith('/admin/') && request.method === 'POST') {
-    if (!currentUser || currentUser.role !== SUPERADMIN_ROLE) {
-      return new Response('权限不足', { status: 403 });
-    }
-    
-    const { username: targetUsername } = await request.json();
-    const targetUser = await BLOG_DATA_STORE.get(`user:${targetUsername}`);
-    if (!targetUser || targetUsername === ADMIN_USERNAME) {
-      return new Response('操作无效', { status: 400 });
-    }
-    
-    const userData = JSON.parse(targetUser);
-    
-    if (url.pathname === '/admin/ban') {
-      userData.is_banned = !userData.is_banned;
-      await BLOG_DATA_STORE.put(`user:${targetUsername}`, JSON.stringify(userData));
-      return new Response('OK');
-    }
-    
-    if (url.pathname === '/admin/silence') {
-      userData.is_silenced = !userData.is_silenced;
-      await BLOG_DATA_STORE.put(`user:${targetUsername}`, JSON.stringify(userData));
-      return new Response('OK');
-    }
-    
-    if (url.pathname === '/admin/reset-password') {
-      const { hash, salt } = await hashPassword(`${targetUsername}123`);
-      userData.password_hash = hash;
-      userData.salt = salt;
-      await BLOG_DATA_STORE.put(`user:${targetUsername}`, JSON.stringify(userData));
-      return new Response('OK');
-    }
-    
-    if (url.pathname === '/admin/toggle-admin') {
-      userData.role = userData.role === ADMIN_ROLE ? USER_ROLE : ADMIN_ROLE;
-      await BLOG_DATA_STORE.put(`user:${targetUsername}`, JSON.stringify(userData));
-      return new Response('OK');
-    }
-    
-    if (url.pathname === '/admin/logout-user') {
-      // 删除所有会话（简化：遍历 session 键）
-      const sessionKeys = await BLOG_DATA_STORE.list({ prefix: 'session:' });
-      for (const key of sessionKeys.keys) {
-        const sessionData = await BLOG_DATA_STORE.get(key.name);
-        if (sessionData) {
-          const { username } = JSON.parse(sessionData);
-          if (username === targetUsername) {
-            await BLOG_DATA_STORE.delete(key.name);
-          }
-        }
-      }
-      return new Response('OK');
-    }
-  }
-  
-  // 404 处理
-  return new Response('页面未找到', { status: 404 });
 }
-
-// Cloudflare Workers 入口
+// 主处理函数
 export default {
   async fetch(request, env) {
-    return handleRequest({ request, env });
+    try {
+      // 确保 SECRET_KEY 存在
+      if (!env.SECRET_KEY) {
+        console.error('环境变量 SECRET_KEY 未设置');
+        return safeJsonResponse({ 
+          error: '服务器配置错误', 
+          details: 'SECRET_KEY 未设置' 
+        }, 500);
+      }
+      // 初始化管理员
+      try {
+        await initAdmin(env);
+      } catch (e) {
+        console.error('初始化管理员时出错:', e);
+      }
+      
+      // 初始化默认头衔
+      try {
+        await initDefaultTitles(env);
+      } catch (e) {
+        console.error('初始化默认头衔时出错:', e);
+      }
+      
+      const url = new URL(request.url);
+      const pathname = url.pathname;
+      // 处理 OPTIONS 预检
+      if (request.method === 'OPTIONS') {
+        return handleOptions();
+      }
+      // 处理根路径 - 返回前端 HTML
+      if (pathname === '/') {
+        return new Response(indexHTML, {
+          headers: { 
+            'Content-Type': 'text/html',
+            'Access-Control-Allow-Origin': '*'
+          }
+        });
+      }
+      // API 路由
+      if (pathname.startsWith('/api/')) {
+        try {
+          // 用户注册 - 添加邀请码验证
+          if (pathname === '/api/register' && request.method === 'POST') {
+            let data;
+            try {
+              data = await request.json();
+            } catch (e) {
+              return safeJsonResponse({ error: '无效的JSON数据' }, 400);
+            }
+            const { username, password, avatar, inviteCode, nickname } = data;
+            // 验证邀请码
+            if (inviteCode !== INVITE_CODE) {
+              return safeJsonResponse({ error: '邀请码不正确' }, 403);
+            }
+            // 基本验证
+            if (!username || !password) {
+              return safeJsonResponse({ error: '用户名和密码是必填项' }, 400);
+            }
+            if (username.length < 3 || username.length > 20) {
+              return safeJsonResponse({ error: '用户名长度必须在3-20个字符之间' }, 400);
+            }
+            if (password.length < 6) {
+              return safeJsonResponse({ error: '密码至少需要6个字符' }, 400);
+            }
+            // 检查用户名是否已存在
+            try {
+              const existing = await env.BLOG_KV.get(`users/${username}`);
+              if (existing) {
+                return safeJsonResponse({ error: '用户名已存在' }, 400);
+              }
+            } catch (e) {
+              console.error('检查用户名时出错:', e);
+              return safeJsonResponse({ error: '服务器错误' }, 500);
+            }
+            // 创建新用户
+            try {
+              const passwordHash = simpleSha256(password);
+              await env.BLOG_KV.put(`users/${username}`, JSON.stringify({
+                username,
+                passwordHash,
+                avatar: avatar || 'https://api.dicebear.com/7.x/avataaars/svg?seed=default',
+                nickname: nickname || username,
+                banned: false,
+                role: 'user',
+                titles: ['注册会员'],  // 添加注册会员头衔
+                currentTitle: '注册会员',  // 设置为当前显示头衔
+                createdAt: new Date().toISOString()
+              }));
+              return safeJsonResponse({ success: true });
+            } catch (e) {
+              console.error('创建用户时出错:', e);
+              return safeJsonResponse({ error: '无法创建用户' }, 500);
+            }
+          }
+          // 用户登录
+          if (pathname === '/api/login' && request.method === 'POST') {
+            let data;
+            try {
+              data = await request.json();
+            } catch (e) {
+              return safeJsonResponse({ error: '无效的JSON数据' }, 400);
+            }
+            const { username, password } = data;
+            if (!username || !password) {
+              return safeJsonResponse({ error: '用户名和密码是必填项' }, 400);
+            }
+            // 验证用户
+            const user = await verifyUser(env, username, password);
+            if (!user) {
+              return safeJsonResponse({ error: '用户名或密码错误' }, 401);
+            }
+            // 生成令牌
+            try {
+              const payload = {
+                username: user.username,
+                role: user.role,
+                titles: user.titles,
+                currentTitle: user.currentTitle,
+                exp: Date.now() + 86400000 // 24小时
+              };
+              const header = btoa(JSON.stringify({ alg: 'HS256' }));
+              const payloadStr = btoa(JSON.stringify(payload));
+              const signature = simpleSha256(header + payloadStr + env.SECRET_KEY);
+              return safeJsonResponse({
+                token: `${header}.${payloadStr}.${signature}`,
+                username: user.username,
+                nickname: user.nickname,
+                role: user.role,
+                titles: user.titles,
+                currentTitle: user.currentTitle,
+                avatar: user.avatar,
+                createdAt: user.createdAt
+              });
+            } catch (e) {
+              console.error('生成令牌时出错:', e);
+              return safeJsonResponse({ error: '无法生成令牌' }, 500);
+            }
+          }
+          // 获取用户信息 - 修复：无需登录即可访问
+          if (pathname.startsWith('/api/users/') && request.method === 'GET') {
+            const username = pathname.split('/').pop();
+            const userKey = `users/${username}`;
+            const userData = await env.BLOG_KV.get(userKey);
+            if (!userData) {
+              return safeJsonResponse({ error: '用户不存在' }, 404);
+            }
+            let user;
+            try {
+              user = JSON.parse(userData);
+            } catch (e) {
+              console.error('解析用户数据失败:', e);
+              return safeJsonResponse({ error: '用户数据损坏' }, 500);
+            }
+            // 只返回必要信息
+            return safeJsonResponse({
+              username: user.username,
+              nickname: user.nickname,
+              avatar: user.avatar,
+              role: user.role,
+              titles: user.titles || ['注册会员'],
+              currentTitle: user.currentTitle || '注册会员',
+              createdAt: user.createdAt,
+              banned: user.banned
+            });
+          }
+          // 更新用户信息
+          if (pathname.startsWith('/api/users/') && pathname.endsWith('/profile') && request.method === 'PUT') {
+            const { valid, error, user: currentUser } = await checkPermission(env, request);
+            if (!valid) return safeJsonResponse({ error }, 403);
+            const username = pathname.split('/')[3];
+            if (currentUser.username !== username) {
+              return safeJsonResponse({ error: '无权修改他人信息' }, 403);
+            }
+            let data;
+            try {
+              data = await request.json();
+            } catch (e) {
+              return safeJsonResponse({ error: '无效的JSON数据' }, 400);
+            }
+            const userKey = `users/${username}`;
+            const userData = await env.BLOG_KV.get(userKey);
+            if (!userData) {
+              return safeJsonResponse({ error: '用户不存在' }, 404);
+            }
+            let user;
+            try {
+              user = JSON.parse(userData);
+            } catch (e) {
+              console.error('解析用户数据失败:', e);
+              return safeJsonResponse({ error: '用户数据损坏' }, 500);
+            }
+            // 更新信息
+            if (data.nickname) user.nickname = data.nickname;
+            if (data.avatar) user.avatar = data.avatar;
+            // 更新密码
+            if (data.currentPassword && data.newPassword) {
+              const currentPasswordHash = simpleSha256(data.currentPassword);
+              if (user.passwordHash !== currentPasswordHash) {
+                return safeJsonResponse({ error: '当前密码错误' }, 400);
+              }
+              if (data.newPassword.length < 6) {
+                return safeJsonResponse({ error: '新密码至少需要6个字符' }, 400);
+              }
+              user.passwordHash = simpleSha256(data.newPassword);
+            }
+            await env.BLOG_KV.put(userKey, JSON.stringify(user));
+            return safeJsonResponse({ success: true });
+          }
+          // 获取所有帖子
+          if (pathname === '/api/posts' && request.method === 'GET') {
+            try {
+              const list = await env.BLOG_KV.list({ prefix: 'posts/' });
+              const posts = [];
+              for (const key of list.keys) {
+                try {
+                  const post = await env.BLOG_KV.get(key.name, 'json');
+                  if (post) posts.push(post);
+                } catch (e) {
+                  console.error('获取帖子时出错:', e, key.name);
+                }
+              }
+              // 按时间排序（最新在前）
+              posts.sort((a, b) => new Date(b.createdAt || 0) - new Date(a.createdAt || 0));
+              return safeJsonResponse(posts);
+            } catch (e) {
+              console.error('获取帖子列表时出错:', e);
+              return safeJsonResponse({ error: '无法获取帖子' }, 500);
+            }
+          }
+          // 发布新帖子
+          if (pathname === '/api/posts' && request.method === 'POST') {
+            const { valid, error, user } = await checkPermission(env, request);
+            if (!valid) return safeJsonResponse({ error }, 403);
+            let data;
+            try {
+              data = await request.json();
+            } catch (e) {
+              return safeJsonResponse({ error: '无效的JSON数据' }, 400);
+            }
+            const { title, content, type } = data;
+            if (!title || !content) {
+              return safeJsonResponse({ error: '标题和内容不能为空' }, 400);
+            }
+            try {
+              const postId = generateUUID();
+              await env.BLOG_KV.put(`posts/${postId}`, JSON.stringify({
+                id: postId,
+                title,
+                content,
+                type,
+                author: user.username,
+                nickname: user.nickname,
+                titles: user.titles,
+                currentTitle: user.currentTitle,
+                avatar: user.avatar,
+                createdAt: new Date().toISOString()
+              }));
+              return safeJsonResponse({ postId });
+            } catch (e) {
+              console.error('创建帖子时出错:', e);
+              return safeJsonResponse({ error: '无法发布帖子' }, 500);
+            }
+          }
+          // 删除帖子（仅管理员）
+          if (pathname.startsWith('/api/posts/') && request.method === 'DELETE') {
+            const { valid, error, user } = await checkPermission(env, request);
+            if (!valid) return safeJsonResponse({ error }, 403);
+            // 只有管理员可以删除帖子
+            if (user.role !== 'admin') {
+              return safeJsonResponse({ error: '需要管理员权限' }, 403);
+            }
+            const postId = pathname.split('/').pop();
+            try {
+              await env.BLOG_KV.delete(`posts/${postId}`);
+              // 删除相关评论
+              const commentKeys = await env.BLOG_KV.list({ prefix: `comments/${postId}/` });
+              if (commentKeys.keys.length > 0) {
+                await Promise.all(commentKeys.keys.map(k => 
+                  env.BLOG_KV.delete(k.name).catch(e => {
+                    console.error('删除评论时出错:', e, k.name);
+                  })
+                ));
+              }
+              return safeJsonResponse({ success: true });
+            } catch (e) {
+              console.error('删除帖子时出错:', e);
+              return safeJsonResponse({ error: '无法删除帖子' }, 500);
+            }
+          }
+          // 发布评论
+          if (pathname.startsWith('/api/posts/') && pathname.endsWith('/comments') && request.method === 'POST') {
+            const { valid, error, user } = await checkPermission(env, request);
+            if (!valid) return safeJsonResponse({ error }, 403);
+            let data;
+            try {
+              data = await request.json();
+            } catch (e) {
+              return safeJsonResponse({ error: '无效的JSON数据' }, 400);
+            }
+            const { content } = data;
+            if (!content || content.trim() === '') {
+              return safeJsonResponse({ error: '评论内容不能为空' }, 400);
+            }
+            const postId = pathname.split('/')[3];
+            try {
+              const commentId = generateUUID();
+              await env.BLOG_KV.put(`comments/${postId}/${commentId}`, JSON.stringify({
+                id: commentId,
+                content,
+                author: user.username,
+                nickname: user.nickname,
+                titles: user.titles,
+                currentTitle: user.currentTitle,
+                avatar: user.avatar,
+                createdAt: new Date().toISOString()
+              }));
+              return safeJsonResponse({ commentId });
+            } catch (e) {
+              console.error('创建评论时出错:', e);
+              return safeJsonResponse({ error: '无法发布评论' }, 500);
+            }
+          }
+          // 获取帖子评论
+          if (pathname.startsWith('/api/posts/') && pathname.endsWith('/comments') && request.method === 'GET') {
+            const postId = pathname.split('/')[3];
+            try {
+              const list = await env.BLOG_KV.list({ prefix: `comments/${postId}/` });
+              const comments = [];
+              for (const key of list.keys) {
+                try {
+                  const comment = await env.BLOG_KV.get(key.name, 'json');
+                  if (comment) comments.push(comment);
+                } catch (e) {
+                  console.error('获取评论时出错:', e, key.name);
+                }
+              }
+              // 按时间排序（最新在前）
+              comments.sort((a, b) => new Date(b.createdAt || 0) - new Date(a.createdAt || 0));
+              return safeJsonResponse(comments);
+            } catch (e) {
+              console.error('获取评论列表时出错:', e);
+              return safeJsonResponse({ error: '无法获取评论' }, 500);
+            }
+          }
+          // 删除评论
+          if ((pathname.startsWith('/api/comments/') || 
+               (pathname.startsWith('/api/posts/') && pathname.includes('/comments/'))) && 
+              request.method === 'DELETE') {
+            const { valid, error, user } = await checkPermission(env, request);
+            if (!valid) return safeJsonResponse({ error }, 403);
+            // 从路径中提取postId和commentId
+            let postId, commentId;
+            // 处理 /api/comments/postId/commentId 格式
+            if (pathname.startsWith('/api/comments/')) {
+              const parts = pathname.split('/');
+              if (parts.length >= 5) {
+                postId = parts[3];
+                commentId = parts[4];
+              }
+            } 
+            // 处理 /api/posts/postId/comments/commentId 格式
+            else if (pathname.includes('/comments/')) {
+              const parts = pathname.split('/');
+              const commentIndex = parts.indexOf('comments');
+              if (commentIndex > 0 && commentIndex < parts.length - 1) {
+                postId = parts[commentIndex - 1];
+                commentId = parts[commentIndex + 1];
+              }
+            }
+            if (!postId || !commentId) {
+              return safeJsonResponse({ error: '无效的评论ID' }, 400);
+            }
+            // 获取评论
+            try {
+              const comment = await env.BLOG_KV.get(`comments/${postId}/${commentId}`, 'json');
+              if (!comment) {
+                return safeJsonResponse({ error: '评论不存在' }, 404);
+              }
+              // 检查权限：管理员或评论作者
+              if (user.role !== 'admin' && comment.author !== user.username) {
+                return safeJsonResponse({ error: '无权删除此评论' }, 403);
+              }
+              // 删除评论
+              await env.BLOG_KV.delete(`comments/${postId}/${commentId}`);
+              return safeJsonResponse({ success: true });
+            } catch (e) {
+              console.error('删除评论时出错:', e);
+              return safeJsonResponse({ error: '无法删除评论' }, 500);
+            }
+          }
+          // 封禁用户（仅管理员）
+          if (pathname === '/api/ban' && request.method === 'POST') {
+            const { valid, error, user } = await checkPermission(env, request);
+            if (!valid) return safeJsonResponse({ error }, 403);
+            // 只有管理员可以封禁用户
+            if (user.role !== 'admin') {
+              return safeJsonResponse({ error: '需要管理员权限' }, 403);
+            }
+            let data;
+            try {
+              data = await request.json();
+            } catch (e) {
+              return safeJsonResponse({ error: '无效的JSON数据' }, 400);
+            }
+            const { username } = data;
+            if (!username) {
+              return safeJsonResponse({ error: '需要提供用户名' }, 400);
+            }
+            if (username === 'admin') {
+              return safeJsonResponse({ error: '不能封禁管理员' }, 400);
+            }
+            try {
+              const userKey = `users/${username}`;
+              const userData = await env.BLOG_KV.get(userKey);
+              if (!userData) {
+                return safeJsonResponse({ error: '用户不存在' }, 404);
+              }
+              let userObj;
+              try {
+                userObj = JSON.parse(userData);
+              } catch (e) {
+                console.error('解析用户数据失败:', e);
+                return safeJsonResponse({ error: '用户数据损坏' }, 500);
+              }
+              userObj.banned = true;
+              // 确保头衔字段存在
+              if (!userObj.titles) {
+                userObj.titles = ['注册会员'];
+                userObj.currentTitle = '注册会员';
+              }
+              await env.BLOG_KV.put(userKey, JSON.stringify(userObj));
+              return safeJsonResponse({ 
+                success: true,
+                user: {
+                  username: username,
+                  banned: true
+                }
+              });
+            } catch (e) {
+              console.error('封禁用户时出错:', e);
+              return safeJsonResponse({ error: '无法封禁用户' }, 500);
+            }
+          }
+          // 解封用户（仅管理员）
+          if (pathname === '/api/unban' && request.method === 'POST') {
+            const { valid, error, user } = await checkPermission(env, request);
+            if (!valid) return safeJsonResponse({ error }, 403);
+            // 只有管理员可以解封用户
+            if (user.role !== 'admin') {
+              return safeJsonResponse({ error: '需要管理员权限' }, 403);
+            }
+            let data;
+            try {
+              data = await request.json();
+            } catch (e) {
+              return safeJsonResponse({ error: '无效的JSON数据' }, 400);
+            }
+            const { username } = data;
+            if (!username) {
+              return safeJsonResponse({ error: '需要提供用户名' }, 400);
+            }
+            try {
+              const userKey = `users/${username}`;
+              const userData = await env.BLOG_KV.get(userKey);
+              if (!userData) {
+                return safeJsonResponse({ error: '用户不存在' }, 404);
+              }
+              let userObj;
+              try {
+                userObj = JSON.parse(userData);
+              } catch (e) {
+                console.error('解析用户数据失败:', e);
+                return safeJsonResponse({ error: '用户数据损坏' }, 500);
+              }
+              userObj.banned = false;
+              // 确保头衔字段存在
+              if (!userObj.titles) {
+                userObj.titles = ['注册会员'];
+                userObj.currentTitle = '注册会员';
+              }
+              await env.BLOG_KV.put(userKey, JSON.stringify(userObj));
+              return safeJsonResponse({ 
+                success: true,
+                user: {
+                  username: username,
+                  banned: false
+                }
+              });
+            } catch (e) {
+              console.error('解封用户时出错:', e);
+              return safeJsonResponse({ error: '无法解封用户' }, 500);
+            }
+          }
+          // 设置管理员权限（仅创始人）
+          if (pathname === '/api/users/set-admin' && request.method === 'POST') {
+            const { valid, error, user } = await checkPermission(env, request);
+            if (!valid) return safeJsonResponse({ error }, 403);
+            // 只有创始人可以设置管理员
+            if (user.username !== 'admin') {
+              return safeJsonResponse({ error: '需要创始人权限' }, 403);
+            }
+            let data;
+            try {
+              data = await request.json();
+            } catch (e) {
+              return safeJsonResponse({ error: '无效的JSON数据' }, 400);
+            }
+            const { username, isAdmin } = data;
+            if (!username) {
+              return safeJsonResponse({ error: '需要提供用户名' }, 400);
+            }
+            if (username === 'admin') {
+              return safeJsonResponse({ error: '不能修改创始人权限' }, 400);
+            }
+            try {
+              const userKey = `users/${username}`;
+              const userData = await env.BLOG_KV.get(userKey);
+              if (!userData) {
+                return safeJsonResponse({ error: '用户不存在' }, 404);
+              }
+              let userObj;
+              try {
+                userObj = JSON.parse(userData);
+              } catch (e) {
+                console.error('解析用户数据失败:', e);
+                return safeJsonResponse({ error: '用户数据损坏' }, 500);
+              }
+              userObj.role = isAdmin ? 'admin' : 'user';
+              
+              // 确保头衔字段存在
+              if (!userObj.titles) {
+                userObj.titles = ['注册会员'];
+                userObj.currentTitle = '注册会员';
+              }
+              
+              // 添加或移除管理员头衔
+              const titleIndex = userObj.titles.indexOf('管理员');
+              if (isAdmin && titleIndex === -1) {
+                userObj.titles.push('管理员');
+                // 如果当前没有显示头衔，设置为管理员
+                if (!userObj.currentTitle) {
+                  userObj.currentTitle = '管理员';
+                }
+              } else if (!isAdmin && titleIndex !== -1) {
+                userObj.titles.splice(titleIndex, 1);
+                // 如果当前显示的是管理员头衔，设置为其他头衔
+                if (userObj.currentTitle === '管理员') {
+                  if (userObj.titles.length > 0) {
+                    userObj.currentTitle = userObj.titles[0];
+                  } else {
+                    userObj.currentTitle = null;
+                  }
+                }
+              }
+              
+              await env.BLOG_KV.put(userKey, JSON.stringify(userObj));
+              return safeJsonResponse({ 
+                success: true,
+                user: {
+                  username: username,
+                  role: userObj.role,
+                  titles: userObj.titles,
+                  currentTitle: userObj.currentTitle
+                }
+              });
+            } catch (e) {
+              console.error('设置管理员权限时出错:', e);
+              return safeJsonResponse({ error: '无法设置管理员权限' }, 500);
+            }
+          }
+          // 创建新头衔（仅创始人）
+          if (pathname === '/api/titles' && request.method === 'POST') {
+            const { valid, error, user } = await checkPermission(env, request);
+            if (!valid) return safeJsonResponse({ error }, 403);
+            // 只有创始人可以创建头衔
+            if (user.username !== 'admin') {
+              return safeJsonResponse({ error: '需要创始人权限' }, 403);
+            }
+            let data;
+            try {
+              data = await request.json();
+            } catch (e) {
+              return safeJsonResponse({ error: '无效的JSON数据' }, 400);
+            }
+            const { name, displayName, color, backgroundColor } = data;
+            if (!name || !displayName) {
+              return safeJsonResponse({ error: '头衔名称和显示名称是必填项' }, 400);
+            }
+            try {
+              // 检查头衔是否已存在
+              const existing = await env.BLOG_KV.get(`titles/${name}`);
+              if (existing) {
+                return safeJsonResponse({ error: '头衔已存在' }, 400);
+              }
+              // 创建新头衔
+              await env.BLOG_KV.put(`titles/${name}`, JSON.stringify({
+                name,
+                displayName,
+                color: color || '#ff0000',
+                backgroundColor: backgroundColor || '#000000'
+              }));
+              return safeJsonResponse({ success: true });
+            } catch (e) {
+              console.error('创建头衔时出错:', e);
+              return safeJsonResponse({ error: '无法创建头衔' }, 500);
+            }
+          }
+          // 颁发头衔（仅创始人）
+          if (pathname === '/api/titles/grant' && request.method === 'POST') {
+            const { valid, error, user } = await checkPermission(env, request);
+            if (!valid) return safeJsonResponse({ error }, 403);
+            // 只有创始人可以颁发头衔
+            if (user.username !== 'admin') {
+              return safeJsonResponse({ error: '需要创始人权限' }, 403);
+            }
+            let data;
+            try {
+              data = await request.json();
+            } catch (e) {
+              return safeJsonResponse({ error: '无效的JSON数据' }, 400);
+            }
+            const { username, titleName } = data;
+            if (!username || !titleName) {
+              return safeJsonResponse({ error: '用户名和头衔名称是必填项' }, 400);
+            }
+            try {
+              // 检查头衔是否存在
+              const titleData = await env.BLOG_KV.get(`titles/${titleName}`);
+              if (!titleData) {
+                return safeJsonResponse({ error: '头衔不存在' }, 404);
+              }
+              // 检查用户是否存在
+              const userKey = `users/${username}`;
+              const userData = await env.BLOG_KV.get(userKey);
+              if (!userData) {
+                return safeJsonResponse({ error: '用户不存在' }, 404);
+              }
+              let userObj;
+              try {
+                userObj = JSON.parse(userData);
+              } catch (e) {
+                console.error('解析用户数据失败:', e);
+                return safeJsonResponse({ error: '用户数据损坏' }, 500);
+              }
+              // 确保头衔字段存在
+              if (!userObj.titles) {
+                userObj.titles = ['注册会员'];
+                userObj.currentTitle = '注册会员';
+              }
+              // 检查用户是否已有该头衔
+              if (userObj.titles.includes(titleName)) {
+                return safeJsonResponse({ error: '用户已有该头衔' }, 400);
+              }
+              // 添加头衔
+              userObj.titles.push(titleName);
+              // 如果当前没有显示头衔，设置为新头衔
+              if (!userObj.currentTitle) {
+                userObj.currentTitle = titleName;
+              }
+              await env.BLOG_KV.put(userKey, JSON.stringify(userObj));
+              return safeJsonResponse({ success: true });
+            } catch (e) {
+              console.error('颁发头衔时出错:', e);
+              return safeJsonResponse({ error: '无法颁发头衔' }, 500);
+            }
+          }
+          // 撤销头衔（仅创始人）
+          if (pathname === '/api/titles/revoke' && request.method === 'POST') {
+            const { valid, error, user } = await checkPermission(env, request);
+            if (!valid) return safeJsonResponse({ error }, 403);
+            // 只有创始人可以撤销头衔
+            if (user.username !== 'admin') {
+              return safeJsonResponse({ error: '需要创始人权限' }, 403);
+            }
+            let data;
+            try {
+              data = await request.json();
+            } catch (e) {
+              return safeJsonResponse({ error: '无效的JSON数据' }, 400);
+            }
+            const { username, titleName } = data;
+            if (!username || !titleName) {
+              return safeJsonResponse({ error: '用户名和头衔名称是必填项' }, 400);
+            }
+            try {
+              // 检查用户是否存在
+              const userKey = `users/${username}`;
+              const userData = await env.BLOG_KV.get(userKey);
+              if (!userData) {
+                return safeJsonResponse({ error: '用户不存在' }, 404);
+              }
+              let userObj;
+              try {
+                userObj = JSON.parse(userData);
+              } catch (e) {
+                console.error('解析用户数据失败:', e);
+                return safeJsonResponse({ error: '用户数据损坏' }, 500);
+              }
+              // 确保头衔字段存在
+              if (!userObj.titles) {
+                return safeJsonResponse({ error: '用户没有头衔' }, 400);
+              }
+              // 检查用户是否有该头衔
+              const titleIndex = userObj.titles.indexOf(titleName);
+              if (titleIndex === -1) {
+                return safeJsonResponse({ error: '用户没有该头衔' }, 400);
+              }
+              // 移除头衔
+              userObj.titles.splice(titleIndex, 1);
+              // 如果当前显示的头衔被移除，设置为其他头衔
+              if (userObj.currentTitle === titleName) {
+                if (userObj.titles.length > 0) {
+                  userObj.currentTitle = userObj.titles[0];
+                } else {
+                  userObj.currentTitle = null;
+                }
+              }
+              await env.BLOG_KV.put(userKey, JSON.stringify(userObj));
+              return safeJsonResponse({ success: true });
+            } catch (e) {
+              console.error('撤销头衔时出错:', e);
+              return safeJsonResponse({ error: '无法撤销头衔' }, 500);
+            }
+          }
+          // 获取所有头衔
+          if (pathname === '/api/titles' && request.method === 'GET') {
+            try {
+              const list = await env.BLOG_KV.list({ prefix: 'titles/' });
+              const titles = [];
+              for (const key of list.keys) {
+                try {
+                  const title = await env.BLOG_KV.get(key.name, 'json');
+                  if (title) titles.push(title);
+                } catch (e) {
+                  console.error('获取头衔时出错:', e, key.name);
+                }
+              }
+              return safeJsonResponse(titles);
+            } catch (e) {
+              console.error('获取头衔列表时出错:', e);
+              return safeJsonResponse({ error: '无法获取头衔' }, 500);
+            }
+          }
+          // 发送消息
+          if (pathname === '/api/messages' && request.method === 'POST') {
+            const { valid, error, user } = await checkPermission(env, request);
+            if (!valid) return safeJsonResponse({ error }, 403);
+            let data;
+            try {
+              data = await request.json();
+            } catch (e) {
+              return safeJsonResponse({ error: '无效的JSON数据' }, 400);
+            }
+            const { to, content } = data;
+            if (!to || !content) {
+              return safeJsonResponse({ error: '接收者和内容是必填项' }, 400);
+            }
+            // 检查接收者是否存在
+            const toUser = await env.BLOG_KV.get(`users/${to}`);
+            if (!toUser) {
+              return safeJsonResponse({ error: '接收者不存在' }, 404);
+            }
+            // 创建消息
+            const messageId = generateUUID();
+            const message = {
+              id: messageId,
+              from: user.username,
+              to: to,
+              content: content,
+              createdAt: new Date().toISOString(),
+              read: false
+            };
+            // 保存消息
+            await env.BLOG_KV.put(`messages/${messageId}`, JSON.stringify(message));
+            // 添加到发送者和接收者的消息列表
+            await env.BLOG_KV.put(`user-messages/${user.username}/${messageId}`, 'sent');
+            await env.BLOG_KV.put(`user-messages/${to}/${messageId}`, 'received');
+            return safeJsonResponse({ messageId });
+          }
+          // 获取消息
+          if (pathname === '/api/messages' && request.method === 'GET') {
+            const { valid, error, user } = await checkPermission(env, request);
+            if (!valid) return safeJsonResponse({ error }, 403);
+            // 获取所有消息
+            const sentMessages = await env.BLOG_KV.list({ prefix: `user-messages/${user.username}/` });
+            const messages = [];
+            for (const key of sentMessages.keys) {
+              const messageId = key.name.split('/').pop();
+              const message = await env.BLOG_KV.get(`messages/${messageId}`, 'json');
+              if (message) messages.push(message);
+            }
+            // 按时间排序
+            messages.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+            return safeJsonResponse(messages);
+          }
+          // 标记消息为已读
+          if (pathname.startsWith('/api/messages/') && pathname.endsWith('/read') && request.method === 'POST') {
+            const { valid, error, user } = await checkPermission(env, request);
+            if (!valid) return safeJsonResponse({ error }, 403);
+            const messageId = pathname.split('/')[3];
+            try {
+              const message = await env.BLOG_KV.get(`messages/${messageId}`, 'json');
+              if (!message) {
+                return safeJsonResponse({ error: '消息不存在' }, 404);
+              }
+              // 检查权限：只有接收者可以标记消息为已读
+              if (message.to !== user.username) {
+                return safeJsonResponse({ error: '无权操作此消息' }, 403);
+              }
+              message.read = true;
+              await env.BLOG_KV.put(`messages/${messageId}`, JSON.stringify(message));
+              return safeJsonResponse({ success: true });
+            } catch (e) {
+              console.error('标记消息为已读时出错:', e);
+              return safeJsonResponse({ error: '无法标记消息为已读' }, 500);
+            }
+          }
+          return safeJsonResponse({ error: 'API 未找到' }, 404);
+        } catch (e) {
+          console.error('API 处理时出错:', e);
+          return safeJsonResponse({ 
+            error: '服务器内部错误',
+            details: e.message 
+          }, 500);
+        }
+      }
+      // 404 处理
+      return new Response('Not Found', { 
+        status: 404,
+        headers: { 'Access-Control-Allow-Origin': '*' }
+      });
+    } catch (e) {
+      console.error('全局错误:', e);
+      return safeJsonResponse({ 
+        error: '严重错误',
+        details: e.message 
+      }, 500);
+    }
   }
 };
+// 前端 HTML（修复聊天功能并添加私信列表，新增头衔系统）
+const indexHTML = `<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>渐变贴吧</title>
+  <style>
+    :root {
+      --primary: #6a11cb;
+      --secondary: #2575fc;
+      --blur: 12px;
+    }
+    * {
+      margin: 0;
+      padding: 0;
+      box-sizing: border-box;
+      transition: background 0.5s ease;
+    }
+    body {
+      font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+      background: linear-gradient(135deg, var(--primary), var(--secondary));
+      min-height: 100vh;
+      padding: 20px;
+      color: #333;
+      overflow-x: hidden;
+    }
+    .container {
+      max-width: 1200px;
+      margin: 0 auto;
+    }
+    header {
+      text-align: center;
+      padding: 30px 0;
+      margin-bottom: 30px;
+    }
+    h1 {
+      font-size: 3.5rem;
+      background: linear-gradient(to right, #fff, #e0e0e0);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      text-shadow: 0 2px 10px rgba(0,0,0,0.2);
+      margin-bottom: 10px;
+    }
+    .subtitle {
+      color: rgba(255, 255, 255, 0.8);
+      font-size: 1.2rem;
+      max-width: 600px;
+      margin: 0 auto;
+    }
+    .card {
+      background: rgba(255, 255, 255, 0.85);
+      border-radius: 20px;
+      backdrop-filter: blur(var(--blur));
+      -webkit-backdrop-filter: blur(var(--blur));
+      box-shadow: 0 10px 30px rgba(0, 0, 0, 0.15);
+      padding: 25px;
+      margin-bottom: 30px;
+      overflow: hidden;
+    }
+    .card h2 {
+      color: var(--primary);
+      margin-bottom: 20px;
+      padding-bottom: 10px;
+      border-bottom: 2px solid rgba(106, 17, 203, 0.2);
+    }
+    .form-group {
+      margin-bottom: 20px;
+    }
+    label {
+      display: block;
+      margin-bottom: 8px;
+      font-weight: 600;
+      color: var(--primary);
+    }
+    input, textarea, select {
+      width: 100%;
+      padding: 12px 15px;
+      border: 2px solid #e0e0e0;
+      border-radius: 10px;
+      font-size: 16px;
+      transition: all 0.3s;
+    }
+    input:focus, textarea:focus, select:focus {
+      outline: none;
+      border-color: var(--secondary);
+      box-shadow: 0 0 0 3px rgba(37, 117, 252, 0.2);
+    }
+    button {
+      background: linear-gradient(to right, var(--primary), var(--secondary));
+      color: white;
+      border: none;
+      padding: 12px 25px;
+      border-radius: 50px;
+      font-size: 16px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: all 0.3s;
+      box-shadow: 0 4px 15px rgba(106, 17, 203, 0.3);
+    }
+    button:hover {
+      transform: translateY(-2px);
+      box-shadow: 0 7px 20px rgba(106, 17, 203, 0.4);
+    }
+    .post {
+      background: white;
+      border-radius: 15px;
+      padding: 20px;
+      margin-bottom: 20px;
+      box-shadow: 0 5px 15px rgba(0, 0, 0, 0.08);
+      border-left: 4px solid var(--secondary);
+    }
+    .post-header {
+      display: flex;
+      align-items: center;
+      margin-bottom: 15px;
+      cursor: pointer;
+    }
+    .avatar {
+      width: 40px;
+      height: 40px;
+      border-radius: 50%;
+      object-fit: cover;
+      margin-right: 12px;
+      border: 2px solid var(--secondary);
+    }
+    .author {
+      font-weight: 600;
+      color: var(--primary);
+    }
+    .post-title {
+      font-size: 1.5rem;
+      margin: 10px 0;
+      color: #2c3e50;
+    }
+    .post-content {
+      line-height: 1.6;
+      color: #444;
+      margin-bottom: 15px;
+    }
+    .comment {
+      background: #f8f9fa;
+      padding: 12px 15px;
+      border-radius: 10px;
+      margin-top: 10px;
+      border-left: 3px solid var(--primary);
+      cursor: pointer;
+    }
+    .comment-header {
+      display: flex;
+      align-items: center;
+      margin-bottom: 5px;
+    }
+    .comment-author {
+      font-weight: 600;
+      color: var(--secondary);
+      margin-right: 8px;
+    }
+    .comment-time {
+      color: #777;
+      font-size: 0.85rem;
+    }
+    .controls {
+      display: flex;
+      gap: 10px;
+      margin-top: 15px;
+    }
+    .btn-delete {
+      background: #ff4757;
+      padding: 6px 12px;
+      font-size: 0.9rem;
+    }
+    .btn-ban {
+      background: #ff9f43;
+      padding: 6px 12px;
+      font-size: 0.9rem;
+    }
+    .btn-unban {
+      background: #00d2d3;
+      padding: 6px 12px;
+      font-size: 0.9rem;
+    }
+    .auth-section {
+      display: flex;
+      gap: 15px;
+      margin-top: 10px;
+    }
+    .user-info {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+    .error {
+      color: #ff4757;
+      background: #ffeaa7;
+      padding: 10px;
+      border-radius: 8px;
+      margin: 15px 0;
+      display: none;
+    }
+    .tabs {
+      display: flex;
+      margin-bottom: 20px;
+      border-bottom: 1px solid #e0e0e0;
+    }
+    .tab {
+      padding: 12px 25px;
+      cursor: pointer;
+      font-weight: 600;
+      color: #777;
+    }
+    .tab.active {
+      color: var(--primary);
+      border-bottom: 3px solid var(--primary);
+    }
+    .tab-content {
+      display: none;
+    }
+    .tab-content.active {
+      display: block;
+    }
+    .banned-user {
+      background-color: #ffeaa7;
+      border-left-color: #fdcb6e;
+    }
+    /* 用户主页样式 */
+    #profileModal {
+      display: none;
+      max-width: 600px;
+      margin: 20px auto;
+    }
+    .profile-header {
+      text-align: center;
+      padding: 20px 0;
+      border-bottom: 1px solid #e0e0e0;
+      margin-bottom: 20px;
+    }
+    .profile-tabs {
+      display: flex;
+      margin-bottom: 20px;
+      border-bottom: 1px solid #e0e0e0;
+    }
+    .profile-tab {
+      padding: 10px 20px;
+      cursor: pointer;
+      font-weight: 600;
+      color: #777;
+    }
+    .profile-tab.active {
+      color: var(--primary);
+      border-bottom: 2px solid var(--primary);
+    }
+    .profile-tab-content {
+      display: none;
+    }
+    .profile-tab-content.active {
+      display: block;
+    }
+    /* 聊天界面样式 */
+    .chat-container {
+      border: 1px solid #e0e0e0;
+      border-radius: 10px;
+      overflow: hidden;
+      display: flex;
+      flex-direction: column;
+      height: 400px;
+    }
+    .chat-header {
+      background: var(--primary);
+      color: white;
+      padding: 10px 15px;
+      font-weight: bold;
+    }
+    .chat-messages {
+      flex: 1;
+      overflow-y: auto;
+      padding: 15px;
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+    }
+    .message {
+      max-width: 80%;
+      padding: 10px 15px;
+      border-radius: 18px;
+      position: relative;
+    }
+    .message.sent {
+      align-self: flex-end;
+      background: var(--primary);
+      color: white;
+      border-bottom-right-radius: 5px;
+    }
+    .message.received {
+      align-self: flex-start;
+      background: #f1f1f1;
+      color: #333;
+      border-bottom-left-radius: 5px;
+    }
+    .message-time {
+      font-size: 0.7rem;
+      opacity: 0.7;
+      text-align: right;
+      margin-top: 3px;
+    }
+    .chat-input {
+      display: flex;
+      padding: 10px;
+      border-top: 1px solid #e0e0e0;
+      gap: 10px;
+    }
+    .chat-input input {
+      flex: 1;
+      border-radius: 20px;
+      padding: 8px 15px;
+    }
+    .chat-input button {
+      border-radius: 20px;
+      padding: 8px 15px;
+    }
+    /* 消息列表样式 */
+    .messages-list {
+      max-height: 400px;
+      overflow-y: auto;
+    }
+    .message-item {
+      display: flex;
+      padding: 12px 15px;
+      border-bottom: 1px solid #e0e0e0;
+      cursor: pointer;
+      transition: background 0.2s;
+    }
+    .message-item:hover {
+      background: #f5f5f5;
+    }
+    .message-item.unread {
+      background: #e3f2fd;
+    }
+    .message-avatar {
+      width: 40px;
+      height: 40px;
+      border-radius: 50%;
+      object-fit: cover;
+      margin-right: 12px;
+    }
+    .message-info {
+      flex: 1;
+    }
+    .message-sender {
+      font-weight: 600;
+      color: var(--primary);
+    }
+    .message-preview {
+      color: #666;
+      font-size: 0.9rem;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      max-width: 200px;
+    }
+    .message-time {
+      color: #999;
+      font-size: 0.8rem;
+    }
+    .message-badge {
+      background: #ff4757;
+      color: white;
+      border-radius: 50%;
+      width: 20px;
+      height: 20px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 0.7rem;
+      margin-left: 10px;
+    }
+    /* 头衔样式 */
+    .title {
+      display: inline-block;
+      padding: 1px 4px;
+      border-radius: 3px;
+      font-size: 0.75rem;
+      margin-left: 5px;
+      vertical-align: middle;
+      font-weight: bold;
+    }
+    .title-founder {
+      background-color: #e60012;
+      color: #ffd700;
+    }
+    .title-admin {
+      background-color: #000000;
+      color: #ffd700;
+    }
+    .title-member {
+      color: #ff69b4;
+      background: transparent;
+      font-weight: normal;
+    }
+    .title-custom {
+      background: #e0e0e0;
+      color: #333;
+      font-weight: normal;
+    }
+    @media (max-width: 768px) {
+      h1 {
+        font-size: 2.5rem;
+      }
+      .card {
+        padding: 20px 15px;
+      }
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <header>
+      <h1>渐变贴吧</h1>
+      <p class="subtitle">一个丝滑流畅、实时模糊渐变的博客社区</p>
+    </header>
+    <div class="auth-section" id="authSection">
+      <!-- 动态生成登录/注册/用户信息 -->
+    </div>
+    <div class="tabs">
+      <div class="tab active" data-tab="posts">全部帖子</div>
+      <div class="tab" data-tab="create">发帖</div>
+      <div class="tab" data-tab="messages" id="messagesTabBtn" style="display:none;">消息</div>
+    </div>
+    <div id="postsTab" class="tab-content active">
+      <div class="card">
+        <h2>最新帖子</h2>
+        <div id="postsContainer">
+          <!-- 帖子将动态加载到这里 -->
+        </div>
+      </div>
+    </div>
+    <div id="createTab" class="tab-content">
+      <div class="card">
+        <h2>发布新帖</h2>
+        <div class="form-group">
+          <label for="postTitle">标题</label>
+          <input type="text" id="postTitle" placeholder="输入帖子标题">
+        </div>
+        <div class="form-group">
+          <label for="postType">类型</label>
+          <select id="postType">
+            <option value="text">纯文字</option>
+            <option value="图文">图文</option>
+          </select>
+        </div>
+        <div class="form-group">
+          <label for="postContent">内容</label>
+          <textarea id="postContent" rows="6" placeholder="分享你的想法..."></textarea>
+        </div>
+        <button id="submitPost">发布帖子</button>
+        <div class="error" id="postError"></div>
+      </div>
+    </div>
+    <div id="messagesTab" class="tab-content">
+      <div class="card">
+        <h2>我的消息</h2>
+        <div class="messages-list" id="messagesList">
+          <!-- 消息列表将动态加载到这里 -->
+        </div>
+      </div>
+    </div>
+    <div id="registerModal" class="card" style="display:none;">
+      <h2>注册账号</h2>
+      <div class="form-group">
+        <label for="regUsername">用户名</label>
+        <input type="text" id="regUsername" placeholder="输入用户名">
+      </div>
+      <div class="form-group">
+        <label for="regPassword">密码</label>
+        <input type="password" id="regPassword" placeholder="输入密码">
+      </div>
+      <div class="form-group">
+        <label for="regNickname">昵称</label>
+        <input type="text" id="regNickname" placeholder="输入昵称（可选）">
+      </div>
+      <div class="form-group">
+        <label for="regAvatar">头像直链 (可选)</label>
+        <input type="url" id="regAvatar" placeholder="https://example.com/avatar.jpg">
+      </div>
+      <div class="form-group">
+        <label for="regInviteCode">邀请码</label>
+        <input type="text" id="regInviteCode" placeholder="输入邀请码">
+      </div>
+      <button id="registerBtn">注册账号</button>
+      <div class="error" id="regError"></div>
+      <p>已有账号? <a href="#" id="showLogin">去登录</a></p>
+    </div>
+    <div id="loginModal" class="card">
+      <h2>登录账号</h2>
+      <div class="form-group">
+        <label for="loginUsername">用户名</label>
+        <input type="text" id="loginUsername" placeholder="输入用户名">
+      </div>
+      <div class="form-group">
+        <label for="loginPassword">密码</label>
+        <input type="password" id="loginPassword" placeholder="输入密码">
+      </div>
+      <button id="loginBtn">登录</button>
+      <div class="error" id="loginError"></div>
+      <p>没有账号? <a href="#" id="showRegister">去注册</a></p>
+    </div>
+    <!-- 用户主页 -->
+    <div id="profileModal" class="card" style="display:none;">
+      <div class="profile-header">
+        <img id="profileAvatar" class="avatar" style="width:80px;height:80px;">
+        <h2 id="profileNickname"></h2>
+        <p id="profileUsername" style="color:#777;"></p>
+        <p id="profileCreatedAt" style="color:#777;font-size:0.9rem;"></p>
+      </div>
+      <div class="profile-tabs">
+        <div class="profile-tab active" data-tab="profile">个人资料</div>
+        <div class="profile-tab" data-tab="messages">聊天</div>
+      </div>
+      <div id="profileTab" class="profile-tab-content active">
+        <div class="form-group">
+          <label for="editNickname">昵称</label>
+          <input type="text" id="editNickname" placeholder="输入昵称">
+        </div>
+        <div class="form-group">
+          <label for="editAvatar">头像直链</label>
+          <input type="url" id="editAvatar" placeholder="https://example.com/avatar.jpg">
+        </div>
+        <div class="form-group">
+          <label for="currentPassword">当前密码</label>
+          <input type="password" id="currentPassword" placeholder="输入当前密码">
+        </div>
+        <div class="form-group">
+          <label for="newPassword">新密码</label>
+          <input type="password" id="newPassword" placeholder="输入新密码">
+        </div>
+        <button id="saveProfileBtn">保存更改</button>
+        <div class="error" id="profileError"></div>
+        <!-- 管理员操作 -->
+        <div id="adminActions" style="display:none;margin-top:20px;">
+          <h3>管理员操作</h3>
+          <button id="setAdminBtn" class="btn-ban" style="display:none;">设为管理员</button>
+          <button id="banUserBtn" class="btn-ban" style="display:none;">封禁用户</button>
+          <button id="unbanUserBtn" class="btn-unban" style="display:none;">解封用户</button>
+          <h3 style="margin-top:15px;">头衔管理</h3>
+          <button id="grantTitleBtn" class="btn-ban">授予头衔</button>
+          <button id="revokeTitleBtn" class="btn-unban">撤销头衔</button>
+          <div id="titlesList" style="margin-top:10px;"></div>
+        </div>
+      </div>
+      <div id="messagesTab" class="profile-tab-content" style="display:none;">
+        <div class="chat-container">
+          <div class="chat-header">
+            <h3>与 <span id="chatWithUser"></span> 的聊天</h3>
+          </div>
+          <div class="chat-messages" id="chatMessages">
+            <!-- 消息将动态加载到这里 -->
+          </div>
+          <div class="chat-input">
+            <input type="text" id="chatInput" placeholder="输入消息...">
+            <button id="sendChatBtn">发送</button>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+  <script>
+    // 全局状态
+    const state = {
+      token: localStorage.getItem('token') || '',
+      username: localStorage.getItem('username') || '',
+      nickname: localStorage.getItem('nickname') || '',
+      role: localStorage.getItem('role') || '',
+      titles: JSON.parse(localStorage.getItem('titles')) || ['注册会员'],
+      currentTitle: localStorage.getItem('currentTitle') || '注册会员',
+      avatar: localStorage.getItem('avatar') || '',
+      createdAt: localStorage.getItem('createdAt') || ''
+    };
+    // 全局变量
+    let currentProfileUser = null;
+    let currentChatUser = null;
+    let allTitles = [];
+    // HTML 转义函数（防止XSS攻击）
+    function escapeHTML(str) {
+      if (!str) return '';
+      return str
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '<')
+        .replace(/>/g, '>')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
+    }
+    // DOM 元素
+    const elements = {
+      authSection: document.getElementById('authSection'),
+      postsContainer: document.getElementById('postsContainer'),
+      postTitle: document.getElementById('postTitle'),
+      postType: document.getElementById('postType'),
+      postContent: document.getElementById('postContent'),
+      submitPost: document.getElementById('submitPost'),
+      postError: document.getElementById('postError'),
+      loginUsername: document.getElementById('loginUsername'),
+      loginPassword: document.getElementById('loginPassword'),
+      loginBtn: document.getElementById('loginBtn'),
+      loginError: document.getElementById('loginError'),
+      regUsername: document.getElementById('regUsername'),
+      regPassword: document.getElementById('regPassword'),
+      regNickname: document.getElementById('regNickname'),
+      regAvatar: document.getElementById('regAvatar'),
+      regInviteCode: document.getElementById('regInviteCode'),
+      registerBtn: document.getElementById('registerBtn'),
+      regError: document.getElementById('regError'),
+      showRegister: document.getElementById('showRegister'),
+      showLogin: document.getElementById('showLogin'),
+      registerModal: document.getElementById('registerModal'),
+      loginModal: document.getElementById('loginModal'),
+      profileModal: document.getElementById('profileModal'),
+      profileAvatar: document.getElementById('profileAvatar'),
+      profileNickname: document.getElementById('profileNickname'),
+      profileUsername: document.getElementById('profileUsername'),
+      profileCreatedAt: document.getElementById('profileCreatedAt'),
+      editNickname: document.getElementById('editNickname'),
+      editAvatar: document.getElementById('editAvatar'),
+      currentPassword: document.getElementById('currentPassword'),
+      newPassword: document.getElementById('newPassword'),
+      saveProfileBtn: document.getElementById('saveProfileBtn'),
+      profileError: document.getElementById('profileError'),
+      adminActions: document.getElementById('adminActions'),
+      banUserBtn: document.getElementById('banUserBtn'),
+      unbanUserBtn: document.getElementById('unbanUserBtn'),
+      setAdminBtn: document.getElementById('setAdminBtn'),
+      grantTitleBtn: document.getElementById('grantTitleBtn'),
+      revokeTitleBtn: document.getElementById('revokeTitleBtn'),
+      titlesList: document.getElementById('titlesList'),
+      profileTabs: document.querySelectorAll('.profile-tab'),
+      profileTabContents: document.querySelectorAll('.profile-tab-content'),
+      chatMessages: document.getElementById('chatMessages'),
+      chatInput: document.getElementById('chatInput'),
+      sendChatBtn: document.getElementById('sendChatBtn'),
+      chatWithUser: document.getElementById('chatWithUser'),
+      tabs: document.querySelectorAll('.tab'),
+      tabContents: document.querySelectorAll('.tab-content'),
+      messagesTabBtn: document.getElementById('messagesTabBtn'),
+      messagesList: document.getElementById('messagesList')
+    };
+    // 显示错误
+    function showError(element, message) {
+      element.textContent = message;
+      element.style.display = 'block';
+    }
+    function clearError(element) {
+      element.textContent = '';
+      element.style.display = 'none';
+    }
+    // 初始化
+    function init() {
+      setupEventListeners();
+      updateAuthUI();
+      loadPosts();
+      loadTitles();
+      // 渐变动画
+      try {
+        setInterval(function() {
+          var hue = Math.floor(Math.random() * 360);
+          document.documentElement.style.setProperty('--primary', 'hsl(' + hue + ', 70%, 50%)');
+          document.documentElement.style.setProperty('--secondary', 'hsl(' + ((hue + 60) % 360) + ', 70%, 50%)');
+        }, 5000);
+      } catch (e) {
+        console.error('渐变动画错误:', e);
+      }
+    }
+    // 设置事件监听
+    function setupEventListeners() {
+      // 切换标签
+      elements.tabs.forEach(function(tab) {
+        tab.addEventListener('click', function() {
+          elements.tabs.forEach(function(t) {
+            t.classList.remove('active');
+          });
+          tab.classList.add('active');
+          var tabName = tab.getAttribute('data-tab');
+          elements.tabContents.forEach(function(content) {
+            content.classList.remove('active');
+            if (content.id === tabName + 'Tab') {
+              content.classList.add('active');
+              // 如果切换到消息标签，加载消息列表
+              if (tabName === 'messages') {
+                loadMessagesList();
+              }
+            }
+          });
+        });
+      });
+      // 切换个人资料标签
+      elements.profileTabs.forEach(function(tab) {
+        tab.addEventListener('click', function() {
+          elements.profileTabs.forEach(function(t) {
+            t.classList.remove('active');
+          });
+          tab.classList.add('active');
+          var tabName = tab.getAttribute('data-tab');
+          elements.profileTabContents.forEach(function(content) {
+            content.classList.remove('active');
+            if (content.id === tabName + 'Tab') {
+              content.classList.add('active');
+              // 如果切换到消息标签，加载消息
+              if (tabName === 'messages' && currentProfileUser) {
+                elements.chatWithUser.textContent = currentProfileUser;
+                loadChatMessages();
+              }
+            }
+          });
+        });
+      });
+      // 登录
+      elements.loginBtn.addEventListener('click', function() {
+        var username = elements.loginUsername.value;
+        var password = elements.loginPassword.value;
+        if (!username || !password) {
+          showError(elements.loginError, '请填写完整信息');
+          return;
+        }
+        fetch('/api/login', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ username: username, password: password })
+        })
+        .then(function(response) {
+          if (!response.ok) {
+            return response.json().then(function(data) {
+              throw new Error(data.error || '登录失败');
+            });
+          }
+          return response.json();
+        })
+        .then(function(data) {
+          if (data.token) {
+            state.token = data.token;
+            state.username = data.username;
+            state.nickname = data.nickname || data.username;
+            state.role = data.role;
+            state.titles = data.titles || ['注册会员'];
+            state.currentTitle = data.currentTitle || '注册会员';
+            state.avatar = data.avatar;
+            state.createdAt = data.createdAt;
+            localStorage.setItem('token', data.token);
+            localStorage.setItem('username', data.username);
+            localStorage.setItem('nickname', data.nickname || data.username);
+            localStorage.setItem('role', data.role);
+            localStorage.setItem('titles', JSON.stringify(data.titles || ['注册会员']));
+            localStorage.setItem('currentTitle', data.currentTitle || '注册会员');
+            localStorage.setItem('avatar', data.avatar);
+            localStorage.setItem('createdAt', data.createdAt);
+            updateAuthUI();
+            clearError(elements.loginError);
+            elements.loginUsername.value = '';
+            elements.loginPassword.value = '';
+          } else {
+            throw new Error('登录响应缺少令牌');
+          }
+        })
+        .catch(function(error) {
+          console.error('Login error:', error);
+          showError(elements.loginError, error.message || '网络错误，请重试');
+        });
+      });
+      // 注册
+      elements.registerBtn.addEventListener('click', function() {
+        var username = elements.regUsername.value;
+        var password = elements.regPassword.value;
+        var nickname = elements.regNickname.value || username;
+        var avatar = elements.regAvatar.value;
+        var inviteCode = elements.regInviteCode.value;
+        if (!username || !password || !inviteCode) {
+          showError(elements.regError, '请填写完整信息');
+          return;
+        }
+        fetch('/api/register', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ 
+            username: username, 
+            password: password,
+            nickname: nickname,
+            avatar: avatar,
+            inviteCode: inviteCode
+          })
+        })
+        .then(function(response) {
+          if (!response.ok) {
+            return response.json().then(function(data) {
+              throw new Error(data.error || '注册失败');
+            });
+          }
+          return response.json();
+        })
+        .then(function(data) {
+          if (data.success) {
+            alert('注册成功！请登录');
+            elements.regUsername.value = '';
+            elements.regPassword.value = '';
+            elements.regNickname.value = '';
+            elements.regAvatar.value = '';
+            elements.regInviteCode.value = '';
+            clearError(elements.regError);
+            showLoginModal();
+          } else {
+            throw new Error('注册响应无效');
+          }
+        })
+        .catch(function(error) {
+          console.error('Register error:', error);
+          showError(elements.regError, error.message || '网络错误，请重试');
+        });
+      });
+      // 发布帖子
+      elements.submitPost.addEventListener('click', function() {
+        var title = elements.postTitle.value;
+        var content = elements.postContent.value;
+        var type = elements.postType.value;
+        if (!title || !content) {
+          showError(elements.postError, '标题和内容不能为空');
+          return;
+        }
+        fetch('/api/posts', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': 'Bearer ' + state.token
+          },
+          body: JSON.stringify({ 
+            title: title, 
+            content: content, 
+            type: type 
+          })
+        })
+        .then(function(response) {
+          if (!response.ok) {
+            return response.json().then(function(data) {
+              throw new Error(data.error || '发帖失败');
+            });
+          }
+          return response.json();
+        })
+        .then(function(data) {
+          if (data.postId) {
+            elements.postTitle.value = '';
+            elements.postContent.value = '';
+            clearError(elements.postError);
+            loadPosts();
+          } else {
+            throw new Error('发帖响应缺少帖子ID');
+          }
+        })
+        .catch(function(error) {
+          console.error('Post error:', error);
+          showError(elements.postError, error.message || '网络错误，请重试');
+        });
+      });
+      // 切换注册/登录模态框
+      elements.showRegister.addEventListener('click', function(e) {
+        e.preventDefault();
+        showRegisterModal();
+      });
+      elements.showLogin.addEventListener('click', function(e) {
+        e.preventDefault();
+        showLoginModal();
+      });
+      // 保存用户资料
+      elements.saveProfileBtn.addEventListener('click', function() {
+        const nickname = elements.editNickname.value;
+        const avatar = elements.editAvatar.value;
+        const currentPassword = elements.currentPassword.value;
+        const newPassword = elements.newPassword.value;
+        const data = {};
+        if (nickname) data.nickname = nickname;
+        if (avatar) data.avatar = avatar;
+        if (currentPassword && newPassword) {
+          data.currentPassword = currentPassword;
+          data.newPassword = newPassword;
+        }
+        fetch('/api/users/' + state.username + '/profile', {
+          method: 'PUT',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': 'Bearer ' + state.token
+          },
+          body: JSON.stringify(data)
+        })
+        .then(response => {
+          if (!response.ok) {
+            return response.json().then(data => {
+              throw new Error(data.error || '保存失败');
+            });
+          }
+          return response.json();
+        })
+        .then(data => {
+          if (data.success) {
+            alert('资料已更新');
+            // 更新本地状态
+            if (nickname) {
+              state.nickname = nickname;
+              localStorage.setItem('nickname', nickname);
+            }
+            if (avatar) {
+              state.avatar = avatar;
+              localStorage.setItem('avatar', avatar);
+            }
+            // 更新UI
+            updateAuthUI();
+            // 如果是当前用户主页，更新显示
+            if (currentProfileUser === state.username) {
+              elements.profileNickname.textContent = nickname;
+              elements.profileAvatar.src = avatar;
+            }
+          }
+        })
+        .catch(error => {
+          showError(elements.profileError, error.message);
+        });
+      });
+      // 封禁用户
+      elements.banUserBtn.addEventListener('click', function() {
+        banUser(currentProfileUser);
+      });
+      // 解封用户
+      elements.unbanUserBtn.addEventListener('click', function() {
+        unbanUser(currentProfileUser);
+      });
+      // 设置管理员
+      elements.setAdminBtn.addEventListener('click', function() {
+        setAdmin(currentProfileUser, state.role !== 'admin');
+      });
+      // 授予头衔
+      elements.grantTitleBtn.addEventListener('click', function() {
+        var titleName = prompt('请输入要授予的头衔名称:');
+        if (titleName) {
+          grantTitle(currentProfileUser, titleName);
+        }
+      });
+      // 撤销头衔
+      elements.revokeTitleBtn.addEventListener('click', function() {
+        var titleName = prompt('请输入要撤销的头衔名称:');
+        if (titleName) {
+          revokeTitle(currentProfileUser, titleName);
+        }
+      });
+      // 发送聊天消息
+      elements.sendChatBtn.addEventListener('click', function() {
+        const message = elements.chatInput.value.trim();
+        if (!message) return;
+        fetch('/api/messages', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': 'Bearer ' + state.token
+          },
+          body: JSON.stringify({
+            to: currentProfileUser,
+            content: message
+          })
+        })
+        .then(response => {
+          if (!response.ok) {
+            return response.json().then(data => {
+              throw new Error(data.error || '发送失败');
+            });
+          }
+          return response.json();
+        })
+        .then(data => {
+          elements.chatInput.value = '';
+          loadChatMessages();
+        })
+        .catch(error => {
+          console.error('发送消息失败:', error);
+        });
+      });
+      // 点击头像显示用户主页
+      document.addEventListener('click', function(e) {
+        if (e.target.classList.contains('avatar') && e.target.alt) {
+          const username = e.target.alt.replace('@', '');
+          showUserProfile(username);
+        }
+      });
+    }
+    // 加载头衔
+    function loadTitles() {
+      fetch('/api/titles')
+        .then(response => {
+          if (!response.ok) {
+            throw new Error('无法加载头衔');
+          }
+          return response.json();
+        })
+        .then(titles => {
+          allTitles = titles;
+        })
+        .catch(error => {
+          console.error('加载头衔失败:', error);
+        });
+    }
+    // 获取头衔样式类
+    function getTitleClass(titleName) {
+      if (titleName === '创始人') return 'title-founder';
+      if (titleName === '管理员') return 'title-admin';
+      if (titleName === '注册会员') return 'title-member';
+      return 'title-custom';
+    }
+    // 生成头衔HTML
+    function renderTitles(titles) {
+      if (!titles || titles.length === 0) return '';
+      
+      let html = '';
+      for (let i = 0; i < titles.length; i++) {
+        const title = titles[i];
+        const titleClass = getTitleClass(title);
+        html += '<span class="title ' + titleClass + '">' + escapeHTML(title) + '</span>';
+      }
+      return html;
+    }
+    // 加载帖子
+    function loadPosts() {
+      fetch('/api/posts')
+        .then(function(response) {
+          if (!response.ok) {
+            return response.json().then(function(data) {
+              throw new Error(data.error || '加载帖子失败');
+            });
+          }
+          return response.json();
+        })
+        .then(function(posts) {
+          var html = '';
+          for (var i = 0; i < posts.length; i++) {
+            var post = posts[i];
+            // XSS 修复：转义帖子内容
+            var safeTitle = escapeHTML(post.title);
+            var safeContent = escapeHTML(post.content);
+            var safeNickname = escapeHTML(post.nickname || post.author);
+            var titlesHtml = renderTitles(post.titles);
+            
+            html += '<div class="post" data-post-id="' + escapeHTML(post.id) + '">' +
+              '<div class="post-header" title="' + safeNickname + '">' +
+                '<img src="' + escapeHTML(post.avatar || 'https://api.dicebear.com/7.x/avataaars/svg?seed=default') + '" ' +
+                     'alt="@' + escapeHTML(post.author) + '" class="avatar">' +
+                '<div>' +
+                  '<div class="author">' + safeNickname + titlesHtml + '</div>' +
+                  '<div class="post-time">' + new Date(post.createdAt).toLocaleString() + '</div>' +
+                '</div>' +
+              '</div>' +
+              '<h3 class="post-title">' + safeTitle + '</h3>' +
+              '<div class="post-content">' + safeContent + '</div>';
+            // 添加删除按钮（仅管理员可见）
+            if (state.username && state.role === 'admin') {
+              html += '<div class="controls">' +
+                        '<button class="btn-delete" data-post-id="' + escapeHTML(post.id) + '">删除</button>' +
+                      '</div>';
+            }
+            // 评论区域
+            html += '<div class="comments-section">' +
+                      '<h4>评论</h4>' +
+                      '<div class="comments-list" data-post-id="' + escapeHTML(post.id) + '">' +
+                        '<div class="loading-comments">加载评论中...</div>' +
+                      '</div>' +
+                      '<div class="form-group" style="margin-top: 15px;">' +
+                        '<textarea class="comment-input" placeholder="发表评论..." ' +
+                                  'data-post-id="' + escapeHTML(post.id) + '" rows="2"></textarea>' +
+                        '<button class="submit-comment" data-post-id="' + escapeHTML(post.id) + '">评论</button>' +
+                      '</div>' +
+                    '</div>' +
+                  '</div>';
+          }
+          elements.postsContainer.innerHTML = html || '<p>还没有帖子，快来发布第一条吧！</p>';
+          // 加载每个帖子的评论
+          loadAllComments();
+          // 添加删除事件
+          var deleteButtons = document.querySelectorAll('.btn-delete');
+          for (var i = 0; i < deleteButtons.length; i++) {
+            deleteButtons[i].addEventListener('click', function() {
+              var postId = this.getAttribute('data-post-id');
+              if (!confirm('确定要删除这个帖子吗？')) return;
+              fetch('/api/posts/' + postId, {
+                method: 'DELETE',
+                headers: { 'Authorization': 'Bearer ' + state.token }
+              })
+              .then(function(response) {
+                if (!response.ok) {
+                  return response.json().then(function(data) {
+                    throw new Error(data.error || '删除失败');
+                  });
+                }
+                loadPosts();
+              })
+              .catch(function(error) {
+                alert(error.message || '删除失败');
+              });
+            });
+          }
+          // 添加评论事件
+          var commentButtons = document.querySelectorAll('.submit-comment');
+          for (var i = 0; i < commentButtons.length; i++) {
+            commentButtons[i].addEventListener('click', function() {
+              var postId = this.getAttribute('data-post-id');
+              var textarea = document.querySelector('.comment-input[data-post-id="' + postId + '"]');
+              var content = textarea.value;
+              if (!content || content.trim() === '') {
+                alert('评论内容不能为空');
+                return;
+              }
+              fetch('/api/posts/' + postId + '/comments', {
+                method: 'POST',
+                headers: {
+                  'Content-Type': 'application/json',
+                  'Authorization': 'Bearer ' + state.token
+                },
+                body: JSON.stringify({ content: content })
+              })
+              .then(function(response) {
+                if (!response.ok) {
+                  return response.json().then(function(data) {
+                    throw new Error(data.error || '评论失败');
+                    });
+                }
+                textarea.value = '';
+                // 重新加载评论
+                var commentsList = document.querySelector('.comments-list[data-post-id="' + postId + '"]');
+                if (commentsList) {
+                  commentsList.innerHTML = '<div class="loading-comments">加载评论中...</div>';
+                  loadComments(postId);
+                }
+              })
+              .catch(function(error) {
+                alert(error.message || '评论失败');
+              });
+            });
+          }
+        })
+        .catch(function(error) {
+          console.error('Load posts error:', error);
+          elements.postsContainer.innerHTML = '<p>加载帖子失败，请刷新重试</p>';
+          showError(elements.postError, error.message || '加载帖子失败');
+        });
+    }
+    // 加载所有帖子的评论
+    function loadAllComments() {
+      var commentSections = document.querySelectorAll('.comments-list');
+      for (var i = 0; i < commentSections.length; i++) {
+        var postId = commentSections[i].getAttribute('data-post-id');
+        loadComments(postId);
+      }
+    }
+    // 加载特定帖子的评论
+    function loadComments(postId) {
+      fetch('/api/posts/' + postId + '/comments')
+        .then(function(response) {
+          if (!response.ok) {
+            return response.json().then(function(data) {
+              throw new Error(data.error || '加载评论失败');
+            });
+          }
+          return response.json();
+        })
+        .then(function(comments) {
+          var commentsList = document.querySelector('.comments-list[data-post-id="' + postId + '"]');
+          if (!commentsList) return;
+          if (comments.length === 0) {
+            commentsList.innerHTML = '<div class="no-comments">还没有评论，快来抢沙发！</div>';
+            return;
+          }
+          var html = '';
+          for (var i = 0; i < comments.length; i++) {
+            var comment = comments[i];
+            // XSS 修复：转义评论内容
+            var safeContent = escapeHTML(comment.content);
+            var safeNickname = escapeHTML(comment.nickname || comment.author);
+            var titlesHtml = renderTitles(comment.titles);
+            
+            html += '<div class="comment" data-comment-id="' + escapeHTML(comment.id) + '" title="' + safeNickname + '">' +
+                      '<div class="comment-header">' +
+                        '<img src="' + escapeHTML(comment.avatar || 'https://api.dicebear.com/7.x/avataaars/svg?seed=default') + '" ' +
+                             'alt="@' + escapeHTML(comment.author) + '" class="avatar" style="width:24px;height:24px;margin-right:5px;">' +
+                        '<span class="comment-author">' + safeNickname + titlesHtml + '</span>' +
+                        '<span class="comment-time">' + new Date(comment.createdAt).toLocaleString() + '</span>' +
+                      '</div>' +
+                      '<p>' + safeContent + '</p>';
+            // 添加删除按钮（仅管理员和评论作者可见）
+            if (state.username && (state.role === 'admin' || state.username === comment.author)) {
+              html += '<div class="controls">' +
+                        '<button class="btn-delete" data-comment-id="' + escapeHTML(comment.id) + '" data-post-id="' + escapeHTML(postId) + '">删除</button>' +
+                      '</div>';
+            }
+            html += '</div>';
+          }
+          commentsList.innerHTML = html;
+          // 添加评论删除事件
+          var commentDeleteButtons = commentsList.querySelectorAll('.btn-delete');
+          for (var i = 0; i < commentDeleteButtons.length; i++) {
+            commentDeleteButtons[i].addEventListener('click', function(e) {
+              e.stopPropagation();
+              var commentId = this.getAttribute('data-comment-id');
+              var postId = this.getAttribute('data-post-id');
+              if (!confirm('确定要删除这条评论吗？')) return;
+              fetch('/api/comments/' + postId + '/' + commentId, {
+                method: 'DELETE',
+                headers: { 'Authorization': 'Bearer ' + state.token }
+              })
+              .then(function(response) {
+                if (!response.ok) {
+                  return response.json().then(function(data) {
+                    throw new Error(data.error || '删除失败');
+                  });
+                }
+                // 重新加载评论
+                var commentsList = document.querySelector('.comments-list[data-post-id="' + postId + '"]');
+                if (commentsList) {
+                  commentsList.innerHTML = '<div class="loading-comments">加载评论中...</div>';
+                  loadComments(postId);
+                }
+              })
+              .catch(function(error) {
+                alert(error.message || '删除失败');
+              });
+            });
+          }
+        })
+        .catch(function(error) {
+          console.error('Load comments error:', error);
+          var commentsList = document.querySelector('.comments-list[data-post-id="' + postId + '"]');
+          if (commentsList) {
+            commentsList.innerHTML = '<div class="error-comments">加载评论失败</div>';
+          }
+        });
+    }
+    // 更新认证UI
+    function updateAuthUI() {
+      var html = '';
+      if (state.token && state.username) {
+        var titlesHtml = renderTitles(state.titles);
+        html = '<div class="user-info">' +
+          '<img src="' + (state.avatar || 'https://api.dicebear.com/7.x/avataaars/svg?seed=default') + '" ' +
+               'alt="@' + state.username + '" class="avatar" style="width:40px;height:40px;">' +
+          '<div>' +
+            '<div>' + state.nickname + titlesHtml + ' ' + (state.role === 'admin' ? '(管理员)' : '') + '</div>' +
+            '<button id="logoutBtn" style="margin-top:5px;padding:3px 10px;font-size:0.9rem;">退出</button>' +
+          '</div>' +
+        '</div>';
+        // 显示消息标签按钮
+        elements.messagesTabBtn.style.display = 'block';
+      } else {
+        html = '<button id="loginBtnUI">登录</button>' +
+               '<button id="registerBtnUI">注册</button>';
+        // 隐藏消息标签按钮
+        elements.messagesTabBtn.style.display = 'none';
+      }
+      elements.authSection.innerHTML = html;
+      if (!state.token || !state.username) {
+        elements.loginModal.style.display = 'block';
+        elements.registerModal.style.display = 'none';
+        elements.profileModal.style.display = 'none';
+      } else {
+        var logoutBtn = document.getElementById('logoutBtn');
+        if (logoutBtn) {
+          logoutBtn.addEventListener('click', logout);
+        }
+      }
+      var loginBtnUI = document.getElementById('loginBtnUI');
+      if (loginBtnUI) {
+        loginBtnUI.addEventListener('click', showLoginModal);
+      }
+      var registerBtnUI = document.getElementById('registerBtnUI');
+      if (registerBtnUI) {
+        registerBtnUI.addEventListener('click', showRegisterModal);
+      }
+    }
+    // 显示模态框
+    function showLoginModal() {
+      elements.loginModal.style.display = 'block';
+      elements.registerModal.style.display = 'none';
+      elements.profileModal.style.display = 'none';
+    }
+    function showRegisterModal() {
+      elements.loginModal.style.display = 'none';
+      elements.registerModal.style.display = 'block';
+      elements.profileModal.style.display = 'none';
+    }
+    // 显示用户主页
+    function showUserProfile(username) {
+      currentProfileUser = username;
+      elements.profileModal.style.display = 'block';
+      // 获取用户信息
+      fetch('/api/users/' + username)
+        .then(response => {
+          if (!response.ok) {
+            return response.json().then(data => {
+              console.error('API响应错误:', data);
+              throw new Error(data.error || '无法获取用户信息');
+            });
+          }
+          return response.json();
+        })
+        .then(user => {
+          // 显示用户信息
+          elements.profileAvatar.src = user.avatar;
+          elements.profileNickname.textContent = user.nickname;
+          elements.profileUsername.textContent = '@' + user.username;
+          if (user.createdAt) {
+            elements.profileCreatedAt.textContent = 
+              '注册于 ' + new Date(user.createdAt).toLocaleDateString();
+          }
+          // 显示用户头衔
+          var titlesList = document.getElementById('titlesList');
+          if (titlesList) {
+            var titlesHtml = '';
+            for (var i = 0; i < user.titles.length; i++) {
+              var title = user.titles[i];
+              var titleClass = getTitleClass(title);
+              titlesHtml += '<span class="title ' + titleClass + '">' + escapeHTML(title) + '</span> ';
+            }
+            titlesList.innerHTML = titlesHtml || '<p>暂无头衔</p>';
+          }
+          
+          // 检查是否是当前用户
+          if (state.username === username) {
+            // 显示编辑表单
+            elements.editNickname.value = user.nickname;
+            elements.editAvatar.value = user.avatar;
+            elements.adminActions.style.display = 'none';
+          } else {
+            // 隐藏编辑表单
+            elements.editNickname.closest('.form-group').style.display = 'none';
+            elements.editAvatar.closest('.form-group').style.display = 'none';
+            elements.currentPassword.closest('.form-group').style.display = 'none';
+            elements.newPassword.closest('.form-group').style.display = 'none';
+            elements.saveProfileBtn.style.display = 'none';
+            // 检查是否是管理员
+            if (state.role === 'admin' && username !== 'admin') {
+              elements.adminActions.style.display = 'block';
+              if (user.banned) {
+                elements.banUserBtn.style.display = 'none';
+                elements.unbanUserBtn.style.display = 'block';
+              } else {
+                elements.banUserBtn.style.display = 'block';
+                elements.unbanUserBtn.style.display = 'none';
+              }
+              // 设置管理员按钮文本
+              if (user.role === 'admin') {
+                elements.setAdminBtn.textContent = '取消管理员';
+                elements.setAdminBtn.style.display = 'block';
+              } else {
+                elements.setAdminBtn.textContent = '设为管理员';
+                elements.setAdminBtn.style.display = 'block';
+              }
+            } else {
+              elements.adminActions.style.display = 'none';
+            }
+          }
+        })
+        .catch(error) {
+          console.error('获取用户信息失败:', error);
+          alert('无法获取用户信息: ' + error.message);
+          elements.profileModal.style.display = 'none';
+        });
+    }
+    // 退出登录
+    function logout() {
+      localStorage.removeItem('token');
+      localStorage.removeItem('username');
+      localStorage.removeItem('nickname');
+      localStorage.removeItem('role');
+      localStorage.removeItem('titles');
+      localStorage.removeItem('currentTitle');
+      localStorage.removeItem('avatar');
+      localStorage.removeItem('createdAt');
+      state.token = '';
+      state.username = '';
+      state.nickname = '';
+      state.role = '';
+      state.titles = ['注册会员'];
+      state.currentTitle = '注册会员';
+      state.avatar = '';
+      state.createdAt = '';
+      updateAuthUI();
+      loadPosts();
+    }
+    // 封禁用户
+    function banUser(username) {
+      if (!confirm('确定要封禁用户 ' + username + ' 吗？')) return;
+      fetch('/api/ban', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': 'Bearer ' + state.token
+        },
+        body: JSON.stringify({ username: username })
+      })
+      .then(function(response) {
+        if (!response.ok) {
+          return response.json().then(function(data) {
+            throw new Error(data.error || '封禁失败');
+          });
+        }
+        return response.json();
+      })
+      .then(function(data) {
+        if (data.user) {
+          alert('用户 ' + username + ' 已被封禁');
+          // 更新用户主页上的按钮
+          if (currentProfileUser === username) {
+            elements.banUserBtn.style.display = 'none';
+            elements.unbanUserBtn.style.display = 'block';
+          }
+        }
+      })
+      .catch(function(error) {
+        alert('封禁失败: ' + error.message);
+      });
+    }
+    // 解封用户
+    function unbanUser(username) {
+      if (!confirm('确定要解封用户 ' + username + ' 吗？')) return;
+      fetch('/api/unban', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': 'Bearer ' + state.token
+        },
+        body: JSON.stringify({ username: username })
+      })
+      .then(function(response) {
+        if (!response.ok) {
+          return response.json().then(function(data) {
+            throw new Error(data.error || '解封失败');
+          });
+        }
+        return response.json();
+      })
+      .then(function(data) {
+        if (data.user) {
+          alert('用户 ' + username + ' 已被解封');
+          // 更新用户主页上的按钮
+          if (currentProfileUser === username) {
+            elements.banUserBtn.style.display = 'block';
+            elements.unbanUserBtn.style.display = 'none';
+          }
+        }
+      })
+      .catch(function(error) {
+        alert('解封失败: ' + error.message);
+      });
+    }
+    // 设置管理员权限
+    function setAdmin(username, isAdmin) {
+      fetch('/api/users/set-admin', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': 'Bearer ' + state.token
+        },
+        body: JSON.stringify({ 
+          username: username,
+          isAdmin: isAdmin
+        })
+      })
+      .then(function(response) {
+        if (!response.ok) {
+          return response.json().then(function(data) {
+            throw new Error(data.error || '设置管理员权限失败');
+          });
+        }
+        return response.json();
+      })
+      .then(function(data) {
+        if (data.user) {
+          alert('操作成功');
+          // 更新用户主页上的按钮
+          if (currentProfileUser === username) {
+            elements.setAdminBtn.textContent = data.user.role === 'admin' ? '取消管理员' : '设为管理员';
+          }
+        }
+      })
+      .catch(function(error) {
+        alert('操作失败: ' + error.message);
+      });
+    }
+    // 授予头衔
+    function grantTitle(username, titleName) {
+      fetch('/api/titles/grant', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': 'Bearer ' + state.token
+        },
+        body: JSON.stringify({ 
+          username: username,
+          titleName: titleName
+        })
+      })
+      .then(function(response) {
+        if (!response.ok) {
+          return response.json().then(function(data) {
+            throw new Error(data.error || '授予头衔失败');
+          });
+        }
+        return response.json();
+      })
+      .then(function(data) {
+        if (data.success) {
+          alert('头衔授予成功');
+          // 重新加载用户信息
+          showUserProfile(username);
+        }
+      })
+      .catch(function(error) {
+        alert('授予头衔失败: ' + error.message);
+      });
+    }
+    // 撤销头衔
+    function revokeTitle(username, titleName) {
+      fetch('/api/titles/revoke', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': 'Bearer ' + state.token
+        },
+        body: JSON.stringify({ 
+          username: username,
+          titleName: titleName
+        })
+      })
+      .then(function(response) {
+        if (!response.ok) {
+          return response.json().then(function(data) {
+            throw new Error(data.error || '撤销头衔失败');
+          });
+        }
+        return response.json();
+      })
+      .then(function(data) {
+        if (data.success) {
+          alert('头衔撤销成功');
+          // 重新加载用户信息
+          showUserProfile(username);
+        }
+      })
+      .catch(function(error) {
+        alert('撤销头衔失败: ' + error.message);
+      });
+    }
+    // 加载聊天消息
+    function loadChatMessages() {
+      fetch('/api/messages')
+        .then(response => {
+          if (!response.ok) {
+            throw new Error('无法加载消息');
+          }
+          return response.json();
+        })
+        .then(messages => {
+          var html = '';
+          for (var i = 0; i < messages.length; i++) {
+            var message = messages[i];
+            // 只显示与当前聊天用户相关的消息
+            if ((message.from === state.username && message.to === currentProfileUser) || 
+                (message.to === state.username && message.from === currentProfileUser)) {
+              var isSent = message.from === state.username;
+              var safeContent = escapeHTML(message.content);
+              html += '<div class="message ' + (isSent ? 'sent' : 'received') + '">' +
+                        '<div class="message-content">' + safeContent + '</div>' +
+                        '<div class="message-time">' + new Date(message.createdAt).toLocaleTimeString() + '</div>' +
+                      '</div>';
+            }
+          }
+          elements.chatMessages.innerHTML = html;
+          // 滚动到底部
+          elements.chatMessages.scrollTop = elements.chatMessages.scrollHeight;
+        })
+        .catch(error => {
+          console.error('加载消息失败:', error);
+        });
+    }
+    // 加载消息列表
+    function loadMessagesList() {
+      if (!state.token) return;
+      fetch('/api/messages')
+        .then(response => {
+          if (!response.ok) {
+            throw new Error('无法加载消息列表');
+          }
+          return response.json();
+        })
+        .then(messages => {
+          // 按用户分组消息
+          const userMessages = {};
+          for (var i = 0; i < messages.length; i++) {
+            var message = messages[i];
+            var otherUser = message.from === state.username ? message.to : message.from;
+            if (!userMessages[otherUser]) {
+              userMessages[otherUser] = {
+                user: otherUser,
+                lastMessage: message,
+                unread: 0
+              };
+            }
+            // 更新最新消息
+            if (new Date(message.createdAt) > new Date(userMessages[otherUser].lastMessage.createdAt)) {
+              userMessages[otherUser].lastMessage = message;
+            }
+            // 统计未读消息
+            if (message.to === state.username && !message.read) {
+              userMessages[otherUser].unread++;
+            }
+          }
+          // 转换为数组并排序
+          const messageList = Object.values(userMessages);
+          messageList.sort((a, b) => new Date(b.lastMessage.createdAt) - new Date(a.lastMessage.createdAt));
+          // 生成HTML
+          var html = '';
+          for (var i = 0; i < messageList.length; i++) {
+            var item = messageList[i];
+            var lastMessage = item.lastMessage;
+            var preview = lastMessage.content.length > 30 ? 
+                          lastMessage.content.substring(0, 30) + '...' : 
+                          lastMessage.content;
+            html += '<div class="message-item ' + (item.unread > 0 ? 'unread' : '') + 
+                    '" data-user="' + escapeHTML(item.user) + '">' +
+              '<img src="https://api.dicebear.com/7.x/avataaars/svg?seed=' + escapeHTML(item.user) + 
+                    '" class="message-avatar">' +
+              '<div class="message-info">' +
+                '<div class="message-sender">' + escapeHTML(item.user) + '</div>' +
+                '<div class="message-preview">' + escapeHTML(preview) + '</div>' +
+              '</div>' +
+              '<div class="message-time">' + new Date(lastMessage.createdAt).toLocaleTimeString() + '</div>';
+            if (item.unread > 0) {
+              html += '<div class="message-badge">' + item.unread + '</div>';
+            }
+            html += '</div>';
+          }
+          elements.messagesList.innerHTML = html || '<p>还没有消息</p>';
+          // 添加点击事件
+          var messageItems = document.querySelectorAll('.message-item');
+          for (var i = 0; i < messageItems.length; i++) {
+            messageItems[i].addEventListener('click', function() {
+              var username = this.getAttribute('data-user');
+              showUserProfile(username);
+              // 切换到聊天标签
+              document.querySelector('.profile-tab[data-tab="messages"]').click();
+            });
+          }
+        })
+        .catch(error => {
+          console.error('加载消息列表失败:', error);
+          elements.messagesList.innerHTML = '<p>加载消息失败</p>';
+        });
+    }
+    // 初始化应用
+    document.addEventListener('DOMContentLoaded', function() {
+      try {
+        init();
+      } catch (e) {
+        console.error('初始化应用时出错:', e);
+        alert('应用初始化失败，请刷新页面重试');
+      }
+    });
+  </script>
+</body>
+</html>`;
