@@ -2668,7 +2668,6 @@ return str
 .replace(/'/g, '&#39;');
 
 }
-
 // 时间格式化函数 - 显示相对时间
 function formatRelativeTime(dateString) {
   const date = new Date(dateString);
@@ -2680,13 +2679,13 @@ function formatRelativeTime(dateString) {
   const diffDays = Math.floor(diffHours / 24);
 
   if (diffSecs < 60) {
-    return `${diffSecs}秒前`;
+    return diffSecs + '秒前';
   } else if (diffMins < 60) {
-    return `${diffMins}分钟前`;
+    return diffMins + '分钟前';
   } else if (diffHours < 24) {
-    return `${diffHours}小时前`;
+    return diffHours + '小时前';
   } else if (diffDays < 30) {
-    return `${diffDays}天前`;
+    return diffDays + '天前';
   } else {
     return date.toLocaleDateString();
   }
@@ -2712,7 +2711,6 @@ function calculateUptime() {
     seconds: diffSecs
   };
 }
-
 // 更新网站运行时间显示
 function updateUptime() {
   const uptime = calculateUptime();
