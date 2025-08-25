@@ -1,4 +1,15 @@
-name = "blog-worker"
+name = "blog"
 main = "worker.js"
 compatibility_date = "2025-08-25"
 
+# 注意：KV 绑定需在 Cloudflare 仪表板手动设置
+# 部署步骤：
+# 1. 使用 wrangler deploy 部署代码
+# 2. 在 Cloudflare Workers 仪表板中：
+#    a. 创建 KV 命名空间，命名为 "BLOG_DATA_STORE"
+#    b. 在 "Variables" 部分绑定 KV 命名空间到变量 BLOG_DATA_STORE
+# 3. 完成部署后访问网站
+
+[[kv_namespaces]]
+binding = "BLOG_DATA_STORE"
+id = ""  # 部署时留空，通过仪表板绑定
