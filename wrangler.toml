@@ -1,17 +1,4 @@
-### wrangler.toml
-
-```toml
-# wrangler.toml - Cloudflare Workers 配置
-name = "personal-blog"
+name = "blog-worker"
 main = "worker.js"
-compatibility_date = "2023-10-15"
+compatibility_date = "2025-08-25"
 
-# 环境变量配置
-[vars]
-# 安全密钥（部署时替换为32位随机字符串）
-SECRET_KEY = "5216dec78ce0446b966437984907e1215216dec78ce0446b966437984907e121"
-
-# KV 命名空间绑定
-[kv_namespaces]
-binding = "BLOG_DATA_STORE"
-id = "5216dec78ce0446b966437984907e121"
