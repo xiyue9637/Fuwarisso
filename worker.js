@@ -237,7 +237,7 @@ export default {
   return new Response(indexHTML, {
   headers: { 
   'Content-Type': 'text/html',
-  'Access-Control-Allow-Origin': '*'
+  'Access-Control-Allow-Origin': '*' 
   }
   });
   }
@@ -315,6 +315,12 @@ export default {
   }
   // 生成令牌
   try {
+  // 确保 BLOG_KEY 存在
+  if (!env.BLOG_KEY) {
+  console.error('BLOG_KEY  未设置 ');
+  return safeJsonResponse({ error: ' 服务器配置错误 ' }, 500);
+  }
+  
   const payload = {
   username: user.username,
   role: user.role,
