@@ -5,6 +5,39 @@ const ADMIN_USERNAME = 'admin';
 const ADMIN_PASSWORD = 'xiyue777';
 const BAN_MESSAGE = ' 您的账号已被管理员封禁 , 请联系  linyi8100@gmail.com  解封 ';
 const INVITE_CODE = 'xiyue666'; // 邀请码
+// Base64 编码函数（替代 btoa，适用于 Cloudflare Workers）
+function base64Encode(str) {
+  const keyStr = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=";
+  let output = "";
+  let chr1, chr2, chr3, enc1, enc2, enc3, enc4;
+  let i = 0;
+
+  // UTF-8 编码
+  str = unescape(encodeURIComponent(str));
+
+  while (i < str.length) {
+    chr1 = str.charCodeAt(i++);
+    chr2 = str.charCodeAt(i++);
+    chr3 = str.charCodeAt(i++);
+
+    enc1 = chr1 >> 2;
+    enc2 = ((chr1 & 3) << 4) | (chr2 >> 4);
+    enc3 = ((chr2 & 15) << 2) | (chr3 >> 6);
+    enc4 = chr3 & 63;
+
+    if (isNaN(chr2)) {
+      enc3 = enc4 = 64;
+    } else if (isNaN(chr3)) {
+      enc4 = 64;
+    }
+
+    output = output +
+      keyStr.charAt(enc1) + keyStr.charAt(enc2) +
+      keyStr.charAt(enc3) + keyStr.charAt(enc4);
+  }
+
+  return output;
+}
 // 简单的 UUID 生成器
 function generateUUID() {
   return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function(c) {
@@ -21,7 +54,7 @@ function simpleSha256(str) {
   for (let i = 0; i < str.length; i++) {
   const chr = str.charCodeAt(i);
   hash = ((hash << 5) - hash) + chr;
-  hash = hash & hash; // Convert to 32bit integer
+  hash = hash & 0xFFFFFFFF; // 修复：确保是32位整数
   }
   return hash.toString(16);
   } catch (e) {
@@ -150,12 +183,49 @@ function decodeToken(token) {
   const parts = token.split('.');
   if (parts.length !== 3) return null;
   const payload = parts[1];
-  const decoded = atob(payload);
-  return JSON.parse(decoded);
+  // 尝试使用 base64Encode 的逆过程
+  try {
+  return JSON.parse(atob(payload));
+  } catch (e) {
+  // 如果 atob 不可用，尝试手动解码
+  return JSON.parse(decodeBase64(payload));
+  }
   } catch (e) {
   console.error(' 解码令牌时出错 :', e);
   return null;
   }
+}
+// 手动 Base64 解码
+function decodeBase64(base64) {
+  const keyStr = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=";
+  let output = "";
+  let chr1, chr2, chr3;
+  let enc1, enc2, enc3, enc4;
+  let i = 0;
+
+  base64 = base64.replace(/[^A-Za-z0-9\+\/\=]/g, "");
+
+  while (i < base64.length) {
+  enc1 = keyStr.indexOf(base64.charAt(i++));
+  enc2 = keyStr.indexOf(base64.charAt(i++));
+  enc3 = keyStr.indexOf(base64.charAt(i++));
+  enc4 = keyStr.indexOf(base64.charAt(i++));
+
+  chr1 = (enc1 << 2) | (enc2 >> 4);
+  chr2 = ((enc2 & 15) << 4) | (enc3 >> 2);
+  chr3 = ((enc3 & 3) << 6) | enc4;
+
+  output = output + String.fromCharCode(chr1);
+
+  if (enc3 != 64) {
+  output = output + String.fromCharCode(chr2);
+  }
+  if (enc4 != 64) {
+  output = output + String.fromCharCode(chr3);
+  }
+  }
+
+  return unescape(encodeURIComponent(output));
 }
 // 检查权限
 async function checkPermission(env, request) {
@@ -327,8 +397,8 @@ export default {
   title: user.title,
   exp: Date.now() + 86400000 // 24 小时
   };
-  const header = btoa(JSON.stringify({ alg: 'HS256' }));
-  const payloadStr = btoa(JSON.stringify(payload));
+  const header = base64Encode(JSON.stringify({ alg: 'HS256' }));
+  const payloadStr = base64Encode(JSON.stringify(payload));
   const signature = simpleSha256(header + payloadStr + env.BLOG_KEY);
   return safeJsonResponse({
   token: `${header}.${payloadStr}.${signature}`,
