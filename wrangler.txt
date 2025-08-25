@@ -1,4 +1,4 @@
-name = "blog-workers"
+name = "1wrangler"
 main = "worker.js"
 compatibility_date = "2025-08-25"
 
