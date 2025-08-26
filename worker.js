@@ -2211,29 +2211,35 @@ const indexHTML = `<!DOCTYPE html>
     let html = '';
     
     for (let i = 1; i <= Math.min(4, totalPages); i++) {
-      html += `<a href="#" class="${i === currentPage ? 'active' : ''}">${i}</a>`;
-    }
-    
-    if (totalPages > 4) {
-      html += '<a href="#">...</a>';
-      html += `<a href="#" class="${totalPages === currentPage ? 'active' : ''}">${totalPages}</a>`;
-    }
-    
-    elements.pagination.innerHTML = html;
-    elements.pagination.style.display = 'flex';
-    
-    const pageLinks = elements.pagination.querySelectorAll('a');
-    pageLinks.forEach(link => {
-      link.addEventListener('click', function(e) {
-        e.preventDefault();
-        const page = parseInt(this.textContent);
-        if (!isNaN(page)) {
-          loadPosts(page);
-        }
-      });
-    });
+function renderPagination(totalPosts, currentPage) {
+  const totalPages = Math.ceil(totalPosts / postsPerPage);
+  let html = '';
+  
+  for (let i = 1; i <= Math.min(4, totalPages); i++) {
+    // 将模板字符串改为普通字符串连接
+    html += '<a href="#" class="' + (i === currentPage ? 'active' : '') + '">' + i + '</a>';
   }
   
+  if (totalPages > 4) {
+    html += '<a href="#">...</a>';
+    // 将模板字符串改为普通字符串连接
+    html += '<a href="#" class="' + (totalPages === currentPage ? 'active' : '') + '">' + totalPages + '</a>';
+  }
+  
+  elements.pagination.innerHTML = html;
+  elements.pagination.style.display = 'flex';
+  
+  const pageLinks = elements.pagination.querySelectorAll('a');
+  pageLinks.forEach(link => {
+    link.addEventListener('click', function(e) {
+      e.preventDefault();
+      const page = parseInt(this.textContent);
+      if (!isNaN(page)) {
+        loadPosts(page);
+      }
+    });
+  });
+}
   function loadAllComments() {
     var commentSections = document.querySelectorAll('.comments-list');
     for (var i = 0; i < commentSections.length; i++) {
