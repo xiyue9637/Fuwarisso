@@ -2751,70 +2751,60 @@ function renderPagination(totalPosts, currentPage) {
   }
   
   function searchPosts(query) {
-    fetch(`/api/search?q=${encodeURIComponent(query)}`)
-    .then(response => {
-      if (!response.ok) {
-        throw new Error('搜索失败');
-      }
-      return response.json();
-    })
-    .then(posts => {
-      var html = '';
-      for (var i = 0; i < posts.length; i++) {
-        var post = posts[i];
-        var safeTitle = escapeHTML(post.title);
-        var safeContent = escapeHTML(post.content);
-        var safeNickname = escapeHTML(post.nickname || post.author);
-        var titleClass = '';
-        if (post.title === '创始人') {
-          titleClass = 'title-founder';
-        } else if (post.title === '管理员') {
-          titleClass = 'title-admin';
-        } else {
-          titleClass = 'title-member';
-        }
-        
-        html += '<div class="post" data-post-id="' + escapeHTML(post.id) + '">' +
-          '<div class="post-header" title="' + safeNickname + '">' +
-          '<img src="' + escapeHTML(post.avatar || 'https://api.dicebear.com/7.x/avataaars/svg?seed=default') + '" ' +
-          'alt="@' + escapeHTML(post.author) + '" class="avatar">' +
-          '<div>' +
-          '<div class="author">' + safeNickname + 
-          (post.title ? ' <span class="' + titleClass + '">' + post.title + '</span>' : '') +
-          '</div>' +
-          '<div class="post-meta">' + 
-          new Date(post.createdAt).toLocaleDateString() + ' | ' + (post.wordCount || 0) + '字 | 阅读 ' + (post.views || 0) + 
-          '次</div>' +
-          '</div>' +
-          '</div>' +
-          '<h3 class="post-title">' + safeTitle + '</h3>' +
-          '<div class="post-content">' + safeContent + '</div>' +
-          '<div class="post-footer">' +
-          '<button class="like-btn" data-post-id="' + escapeHTML(post.id) + '">👍🏾' + (post.likes || 0) + '</button>' +
-          '</div>' +
-          '<div class="comments-section">' +
-          '<h4>评论</h4>' +
-          '<div class="comments-list" data-post-id="' + escapeHTML(post.id) + '">' +
-          '<div class="loading-comments">加载评论中...</div>' +
-          '</div>' +
-          '<div class="form-group" style="margin-top: 15px;">' +
-          '<textarea class="comment-input" placeholder="发表评论..." ' +
-          'data-post-id="' + escapeHTML(post.id) + '" rows="2"></textarea>' +
-          '<button class="submit-comment" data-post-id="' + escapeHTML(post.id) + '">评论</button>' +
-          '</div>' +
-          '</div>' +
-          '</div>';
-      }
+function searchPosts(query) {
+  fetch('/api/search?q=' + encodeURIComponent(query))
+  .then(response => {
+    if (!response.ok) {
+      throw new Error('搜索失败');
+    }
+    return response.json();
+  })
+  .then(posts => {
+    var html = '';
+    for (var i = 0; i < posts.length; i++) {
+      var post = posts[i];
+      var safeTitle = escapeHTML(post.title);
+      var safeContent = escapeHTML(post.content);
+      var safeNickname = escapeHTML(post.nickname || post.author);
       
-      elements.postsContainer.innerHTML = html || '<p>没有找到相关帖子</p>';
-      loadAllComments();
-    })
-    .catch(error => {
-      console.error('搜索失败:', error);
-      alert('搜索失败: ' + error.message);
-    });
-  }
-  
+      html += '<div class="post" data-post-id="' + escapeHTML(post.id) + '">' +
+        '<div class="post-header" title="' + safeNickname + '">' +
+        '<img src="' + escapeHTML(post.avatar || 'https://api.dicebear.com/7.x/avataaars/svg?seed=default') + '" ' +
+        'alt="@' + escapeHTML(post.author) + '" class="avatar">' +
+        '<div>' +
+        '<div class="author">' + safeNickname + '</div>' +
+        '<div class="post-meta">' + 
+        new Date(post.createdAt).toLocaleDateString() + ' | ' + (post.wordCount || 0) + '字 | 阅读 ' + (post.views || 0) + 
+        '次</div>' +
+        '</div>' +
+        '</div>' +
+        '<h3 class="post-title">' + safeTitle + '</h3>' +
+        '<div class="post-content">' + safeContent + '</div>' +
+        '<div class="post-footer">' +
+        '<button class="like-btn" data-post-id="' + escapeHTML(post.id) + '">👍🏾' + (post.likes || 0) + '</button>' +
+        '</div>' +
+        '<div class="comments-section">' +
+        '<h4>评论</h4>' +
+        '<div class="comments-list" data-post-id="' + escapeHTML(post.id) + '">' +
+        '<div class="loading-comments">加载评论中...</div>' +
+        '</div>' +
+        '<div class="form-group" style="margin-top: 15px;">' +
+        '<textarea class="comment-input" placeholder="发表评论..." ' +
+        'data-post-id="' + escapeHTML(post.id) + '" rows="2"></textarea>' +
+        '<button class="submit-comment" data-post-id="' + escapeHTML(post.id) + '">评论</button>' +
+        '</div>' +
+        '</div>' +
+        '</div>';
+    }
+    
+    elements.postsContainer.innerHTML = html || '<p>没有找到相关帖子</p>';
+    loadAllComments();
+  })
+  .catch(error => {
+    console.error('搜索失败:', error);
+    alert('搜索失败: ' + error.message);
+  });
+}
   function toggleLike(postId) {
     fetch(`/api/posts/${postId}/like`, {
       method: 'POST',
